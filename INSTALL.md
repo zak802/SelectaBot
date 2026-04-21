@@ -1,160 +1,194 @@
 # SelectaBot — Installation Guide
 
-This guide is written for AI agents (Claude Code, OpenClaw, Hermes, Cursor, etc.) to follow step by step. Run each step in order.
+This guide is written for AI agents (Claude Code, OpenClaw, Hermes, Cursor, etc.) to follow step by step. Ask the user each question before proceeding.
 
 ---
 
-## Prerequisites Check
+## Step 0: Choose Hosting Method
+
+Ask the user:
+
+> "Where do you want to run SelectaBot?"
+> 
+> **A) VPS or server** (Hostinger, DigitalOcean, Hetzner, etc.) — best performance, ~$4-6/month  
+> **B) Railway** — easiest, no server knowledge needed, ~$5/month  
+> **C) My own laptop/Mac** — free, but bot stops when laptop sleeps  
+
+Then follow the matching section below.
+
+---
+
+## Option A: VPS / Server
+
+### Prerequisites Check
 
 ```bash
-# Check Node.js (need v20+)
-node --version
-
-# Check Zora CLI
+node --version     # need v20+
 zora --version 2>/dev/null || echo "NOT INSTALLED"
-
-# Check pm2
 pm2 --version 2>/dev/null || echo "NOT INSTALLED"
 ```
 
-Install anything missing:
+Install missing tools:
 ```bash
 # Zora CLI
 npm install -g @zoralabs/cli --prefix ~/.local
 export PATH="$HOME/.local/bin:$PATH"
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 
-# pm2 (process manager to keep bot running)
+# pm2
 npm install -g pm2 --prefix ~/.local
 ```
 
----
+### Get Telegram Bot Token
 
-## Step 1: Get a Telegram Bot Token
+1. Message **@BotFather** on Telegram
+2. Send `/newbot`, follow prompts
+3. Copy the token it gives you
 
-1. Open Telegram and message **@BotFather**
-2. Send `/newbot`
-3. Follow the prompts — choose a name and username
-4. Copy the token it gives you (looks like `8573527678:AAH3Ez...`)
-
-Ask the user to paste their token here before continuing.
-
----
-
-## Step 2: Get Your Telegram User ID
+### Get Your Telegram User ID
 
 1. Message **@userinfobot** on Telegram
-2. It replies with your numeric ID (e.g. `178754373`)
+2. Copy your numeric ID
 
-Ask the user to paste their ID here before continuing.
-
----
-
-## Step 3: Create a Zora Wallet
+### Create Zora Wallet
 
 ```bash
 zora setup --create
 ```
 
-This creates a wallet at `~/.config/zora/wallet.json`.
-
-**Important:** Tell the user to back up `~/.config/zora/wallet.json` — it contains their private key. No backup = no recovery if lost.
-
-Show them the wallet address:
+Show the wallet address to the user:
 ```bash
 zora wallet info
 ```
 
-Tell them to fund this address with ETH on **Base chain** before trading.
+Tell them: fund this address with **ETH on Base chain** before trading.
 
----
-
-## Step 4: (Optional) Create a Separate DCA Wallet
-
-For tracking DCA performance separately from manual buys:
-
-```bash
-cp ~/.config/zora/wallet.json ~/.config/zora/wallet-buyer.json
-zora setup --create  # creates a new wallet at wallet.json
-cp ~/.config/zora/wallet.json ~/.config/zora/wallet-dca.json
-cp ~/.config/zora/wallet-buyer.json ~/.config/zora/wallet.json
-```
-
-Or skip this and use the same wallet for everything (set both paths to `wallet.json`).
-
----
-
-## Step 5: Write the .env File
-
-Create a file called `.env` in the SelectaBot directory:
+### Write .env
 
 ```bash
 cat > .env << EOF
-TELEGRAM_BOT_TOKEN=<paste token from Step 1>
-ADMIN_TELEGRAM_ID=<paste ID from Step 2>
-BUYER_WALLET_PATH=$HOME/.config/zora/wallet.json
-DCA_WALLET_PATH=$HOME/.config/zora/wallet-dca.json
-EOF
-```
-
-If using one wallet for everything:
-```bash
-cat > .env << EOF
-TELEGRAM_BOT_TOKEN=<token>
-ADMIN_TELEGRAM_ID=<id>
+TELEGRAM_BOT_TOKEN=PASTE_TOKEN_HERE
+ADMIN_TELEGRAM_ID=PASTE_ID_HERE
 BUYER_WALLET_PATH=$HOME/.config/zora/wallet.json
 DCA_WALLET_PATH=$HOME/.config/zora/wallet.json
 EOF
 ```
 
----
-
-## Step 6: Install Dependencies
+### Install & Start
 
 ```bash
 npm install
-```
-
----
-
-## Step 7: Start the Bot
-
-```bash
 pm2 start bot.js --name selectabot
 pm2 save
+pm2 startup   # makes bot survive server reboots
 ```
 
-Verify it's running:
+### Verify
+
 ```bash
 pm2 status
 pm2 logs selectabot --lines 10 --nostream
 ```
 
----
-
-## Step 8: Test
-
-1. Open Telegram
-2. Find your bot by the username you gave it in Step 1
-3. Send `/start`
-4. You should see the main menu
+DM your bot `/start` — you should see the main menu. ✅
 
 ---
 
-## Done! 🎉
+## Option B: Railway
 
-Your SelectaBot is live. Fund your wallet and start trading.
+### 1. Fork or use the template
+
+Click **"Use this template"** on `github.com/zak802/SelectaBot` to get your own copy on GitHub.
+
+### 2. Deploy to Railway
+
+Go to `railway.app` → New Project → Deploy from GitHub repo → select your copy of SelectaBot.
+
+### 3. Set Environment Variables
+
+In Railway dashboard → your project → Variables tab, add:
+
+| Variable | Value |
+|----------|-------|
+| `TELEGRAM_BOT_TOKEN` | Your token from @BotFather |
+| `ADMIN_TELEGRAM_ID` | Your Telegram user ID (from @userinfobot) |
+| `BUYER_WALLET_PATH` | `/app/wallet.json` |
+| `DCA_WALLET_PATH` | `/app/wallet.json` |
+| `ZORA_PRIVATE_KEY` | Your wallet private key (see below) |
+
+### 4. Create Zora Wallet
+
+Run locally (need Node.js):
+```bash
+npm install -g @zoralabs/cli --prefix ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+zora setup --create
+cat ~/.config/zora/wallet.json
+```
+
+Copy the `privateKey` value → paste as `ZORA_PRIVATE_KEY` in Railway variables.
+
+**Back up the private key somewhere safe.**
+
+### 5. Update bot.js for Railway
+
+Railway uses environment variables directly instead of wallet files. Add to the top of bot.js (or update .env handling):
+
+```js
+// In bot.js, the cliEnv() function already reads ZORA_PRIVATE_KEY from env
+// No wallet file needed on Railway — just set ZORA_PRIVATE_KEY in dashboard
+```
+
+### 6. Deploy
+
+Railway auto-deploys when you push to GitHub. Check the deploy logs in Railway dashboard.
+
+DM your bot `/start` — you should see the main menu. ✅
 
 ---
 
-## Updating
+## Option C: Local (Mac/Linux laptop)
 
-When updates are released, run:
+### Prerequisites
 
+```bash
+node --version     # need v20+
+```
+
+Install Zora CLI:
+```bash
+npm install -g @zoralabs/cli --prefix ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Setup
+
+Same as Option A (VPS), but use:
+```bash
+node bot.js   # instead of pm2
+```
+
+Or with pm2 to keep it running in background:
+```bash
+npm install -g pm2 --prefix ~/.local
+pm2 start bot.js --name selectabot
+```
+
+**Note:** Bot will stop when you shut down your laptop. For always-on, use Option A or B.
+
+---
+
+## Updating (all options)
+
+### VPS / Local:
 ```bash
 bash update.sh
 ```
 
-Or tell your AI agent: **"update SelectaBot"**
+### Railway:
+Push to your GitHub repo — Railway auto-deploys.
+
+Or tell your agent: **"update SelectaBot"**
 
 ---
 
@@ -172,7 +206,7 @@ export PATH="$HOME/.local/bin:$PATH"
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 ```
 
-**Wrong wallet balance:**
+**Check wallet balance:**
 ```bash
 zora balance --json
 ```

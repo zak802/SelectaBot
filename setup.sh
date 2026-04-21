@@ -2,99 +2,166 @@
 set -e
 
 echo ""
-echo "🐸 ZoraCLI Bot Setup"
+echo "🎛️  SelectaBot Setup"
 echo "════════════════════════════════════"
 echo ""
-
-# Check Node.js
-if ! command -v node &>/dev/null; then
-  echo "❌ Node.js not found. Install from https://nodejs.org (v20+)"
-  exit 1
-fi
-
-# Check/install Zora CLI
-if ! command -v zora &>/dev/null; then
-  echo "📦 Installing Zora CLI..."
-  npm install -g @zoralabs/cli --prefix ~/.local
-  export PATH="$HOME/.local/bin:$PATH"
-  echo "✅ Zora CLI installed"
-else
-  echo "✅ Zora CLI found: $(zora --version 2>/dev/null | head -1)"
-fi
-
+echo "Where will SelectaBot run?"
 echo ""
-echo "━━━━ Step 1: Telegram Bot ━━━━"
-echo "1. Open Telegram and message @BotFather"
-echo "2. Send /newbot and follow the prompts"
-echo "3. Copy the token it gives you"
+echo "  A) VPS or server (Hostinger, DigitalOcean, etc.)"
+echo "  B) Railway (easiest, no server needed)"
+echo "  C) My laptop / local machine"
 echo ""
-read -rp "Paste your Telegram bot token: " BOT_TOKEN
+read -rp "Choose A, B, or C: " HOSTING
 
-echo ""
-echo "━━━━ Step 2: Your Telegram ID ━━━━"
-echo "1. Message @userinfobot on Telegram"
-echo "2. It will reply with your user ID"
-echo ""
-read -rp "Paste your Telegram user ID: " ADMIN_ID
+case "${HOSTING^^}" in
 
-echo ""
-echo "━━━━ Step 3: Zora Wallet ━━━━"
-echo "Creating a new Zora wallet (or press Enter to use existing)..."
-echo ""
-read -rp "Create new wallet? (y/n): " CREATE_WALLET
+  A|VPS)
+    echo ""
+    echo "━━━━ VPS Setup ━━━━"
 
-if [ "$CREATE_WALLET" = "y" ]; then
-  zora setup --create
-  echo ""
-  echo "⚠️  IMPORTANT: Back up ~/.config/zora/wallet.json — this is your wallet!"
-fi
+    # Check/install Zora CLI
+    if ! command -v zora &>/dev/null; then
+      echo "📦 Installing Zora CLI..."
+      npm install -g @zoralabs/cli --prefix ~/.local
+      export PATH="$HOME/.local/bin:$PATH"
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+    fi
 
-WALLET_PATH="$HOME/.config/zora/wallet.json"
+    # Check/install pm2
+    if ! command -v pm2 &>/dev/null; then
+      echo "📦 Installing pm2..."
+      npm install -g pm2 --prefix ~/.local
+      export PATH="$HOME/.local/bin:$PATH"
+    fi
 
-echo ""
-echo "━━━━ Step 4: DCA Wallet (optional) ━━━━"
-echo "Use a separate wallet for DCA buys? (recommended for tracking)"
-read -rp "Create DCA wallet? (y/n): " CREATE_DCA
+    echo ""
+    echo "━━━━ Telegram Bot ━━━━"
+    echo "1. Message @BotFather on Telegram"
+    echo "2. Send /newbot and follow the prompts"
+    echo "3. Copy the token it gives you"
+    echo ""
+    read -rp "Paste your bot token: " BOT_TOKEN
 
-if [ "$CREATE_DCA" = "y" ]; then
-  ZORA_WALLET_PATH="$HOME/.config/zora/wallet-dca.json" zora setup --create 2>/dev/null || true
-  DCA_WALLET_PATH="$HOME/.config/zora/wallet-dca.json"
-else
-  DCA_WALLET_PATH="$WALLET_PATH"
-fi
+    echo ""
+    echo "━━━━ Your Telegram ID ━━━━"
+    echo "Message @userinfobot on Telegram to get your ID"
+    echo ""
+    read -rp "Paste your Telegram user ID: " ADMIN_ID
 
-echo ""
-echo "━━━━ Writing config ━━━━"
-cat > .env << EOF
+    echo ""
+    echo "━━━━ Zora Wallet ━━━━"
+    read -rp "Create a new Zora wallet? (y/n): " CREATE_WALLET
+    if [ "${CREATE_WALLET,,}" = "y" ]; then
+      zora setup --create
+      echo ""
+      echo "⚠️  Back up ~/.config/zora/wallet.json — this is your private key!"
+    fi
+
+    cat > .env << EOF
 TELEGRAM_BOT_TOKEN=$BOT_TOKEN
 ADMIN_TELEGRAM_ID=$ADMIN_ID
-BUYER_WALLET_PATH=$WALLET_PATH
-DCA_WALLET_PATH=$DCA_WALLET_PATH
+BUYER_WALLET_PATH=$HOME/.config/zora/wallet.json
+DCA_WALLET_PATH=$HOME/.config/zora/wallet.json
 EOF
 
-echo "✅ .env created"
+    npm install
+    pm2 start bot.js --name selectabot && pm2 save
+    pm2 startup 2>/dev/null || true
 
-echo ""
-echo "━━━━ Installing dependencies ━━━━"
-npm install
+    WALLET_ADDR=$(zora wallet info 2>/dev/null | grep -oE '0x[a-fA-F0-9]{40}' | head -1 || echo "run: zora wallet info")
+    echo ""
+    echo "════════════════════════════════════"
+    echo "🚀 SelectaBot is live!"
+    echo ""
+    echo "Fund your wallet on Base chain:"
+    echo "  $WALLET_ADDR"
+    echo ""
+    echo "Then DM your bot on Telegram and send /start"
+    echo "════════════════════════════════════"
+    ;;
 
-echo ""
-echo "━━━━ Starting bot ━━━━"
-if command -v pm2 &>/dev/null; then
-  pm2 start bot.js --name zoraCLI-bot && pm2 save
-  echo "✅ Bot running via PM2"
-else
-  npm install -g pm2 --prefix ~/.local 2>/dev/null || true
-  export PATH="$HOME/.local/bin:$PATH"
-  pm2 start bot.js --name zoraCLI-bot && pm2 save
-fi
+  B|RAILWAY)
+    echo ""
+    echo "━━━━ Railway Setup ━━━━"
+    echo ""
+    echo "Steps:"
+    echo ""
+    echo "1. Push this repo to your GitHub account"
+    echo "   (click 'Use this template' on github.com/zak802/SelectaBot)"
+    echo ""
+    echo "2. Go to railway.app → New Project → Deploy from GitHub"
+    echo "   Select your copy of SelectaBot"
+    echo ""
+    echo "3. In Railway Variables tab, add:"
+    echo "   TELEGRAM_BOT_TOKEN = (your bot token from @BotFather)"
+    echo "   ADMIN_TELEGRAM_ID  = (your ID from @userinfobot)"
+    echo "   ZORA_PRIVATE_KEY   = (your wallet private key — see below)"
+    echo ""
+    echo "━━━━ Creating Zora Wallet ━━━━"
+    if ! command -v zora &>/dev/null; then
+      npm install -g @zoralabs/cli --prefix ~/.local
+      export PATH="$HOME/.local/bin:$PATH"
+    fi
+    zora setup --create
+    echo ""
+    echo "Your private key is in ~/.config/zora/wallet.json"
+    echo "Copy the 'privateKey' value → paste as ZORA_PRIVATE_KEY in Railway"
+    echo ""
+    echo "⚠️  Back up this key somewhere safe. Do NOT commit it to GitHub."
+    echo ""
+    echo "4. Railway auto-deploys once variables are set."
+    echo "   DM your bot /start to test."
+    echo ""
+    echo "To update later: push to GitHub → Railway auto-redeploys"
+    ;;
 
-echo ""
-echo "════════════════════════════════════"
-echo "🚀 ZoraCLI Bot is live!"
-echo ""
-echo "→ DM your bot on Telegram and send /start"
-echo "→ Fund your wallet: $(zora wallet info 2>/dev/null | grep Address || echo 'run: zora wallet info')"
-echo ""
-echo "To update later: git pull upstream main && pm2 restart zoraCLI-bot"
-echo "════════════════════════════════════"
+  C|LOCAL)
+    echo ""
+    echo "━━━━ Local Setup ━━━━"
+
+    if ! command -v zora &>/dev/null; then
+      echo "📦 Installing Zora CLI..."
+      npm install -g @zoralabs/cli --prefix ~/.local
+      export PATH="$HOME/.local/bin:$PATH"
+    fi
+
+    echo ""
+    echo "━━━━ Telegram Bot ━━━━"
+    read -rp "Bot token from @BotFather: " BOT_TOKEN
+    read -rp "Your Telegram user ID (@userinfobot): " ADMIN_ID
+
+    read -rp "Create a new Zora wallet? (y/n): " CREATE_WALLET
+    if [ "${CREATE_WALLET,,}" = "y" ]; then
+      zora setup --create
+    fi
+
+    cat > .env << EOF
+TELEGRAM_BOT_TOKEN=$BOT_TOKEN
+ADMIN_TELEGRAM_ID=$ADMIN_ID
+BUYER_WALLET_PATH=$HOME/.config/zora/wallet.json
+DCA_WALLET_PATH=$HOME/.config/zora/wallet.json
+EOF
+
+    npm install
+
+    echo ""
+    echo "════════════════════════════════════"
+    echo "✅ Setup complete!"
+    echo ""
+    echo "Start the bot:"
+    echo "  node bot.js"
+    echo ""
+    echo "Or keep it running in background:"
+    echo "  npm install -g pm2 --prefix ~/.local"
+    echo "  pm2 start bot.js --name selectabot"
+    echo ""
+    echo "⚠️  Bot will stop when your laptop sleeps."
+    echo "   For always-on, use a VPS or Railway."
+    echo "════════════════════════════════════"
+    ;;
+
+  *)
+    echo "❌ Please choose A, B, or C"
+    exit 1
+    ;;
+esac
