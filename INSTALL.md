@@ -178,6 +178,54 @@ pm2 start bot.js --name selectabot
 
 ---
 
+
+## Option D: Other (Docker, Render, Fly.io, custom)
+
+If none of the above match, here's what you need to know so your agent can figure it out:
+
+**Requirements:**
+- Node.js 20+
+- Bot runs as: `node bot.js`
+- No HTTP port needed — uses Telegram long-polling
+- Process must stay alive (use your platform's restart policy)
+
+**Environment variables to set:**
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | ✅ | From @BotFather |
+| `ADMIN_TELEGRAM_ID` | ✅ | Your Telegram numeric ID |
+| `ZORA_PRIVATE_KEY` | ✅ if no wallet file | Private key from wallet.json |
+| `BUYER_WALLET_PATH` | ✅ if no ZORA_PRIVATE_KEY | Path to wallet.json |
+| `DCA_WALLET_PATH` | ✅ if no ZORA_PRIVATE_KEY | Path to wallet-dca.json (can be same as buyer) |
+
+**Platform quick-start:**
+
+```bash
+# Docker
+docker run -e TELEGRAM_BOT_TOKEN=... -e ADMIN_TELEGRAM_ID=... -e ZORA_PRIVATE_KEY=... node:20 node bot.js
+
+# Render — set env vars in dashboard, start command: node bot.js
+
+# Fly.io
+fly secrets set TELEGRAM_BOT_TOKEN=... ADMIN_TELEGRAM_ID=... ZORA_PRIVATE_KEY=...
+fly deploy
+
+# Heroku
+heroku config:set TELEGRAM_BOT_TOKEN=... ADMIN_TELEGRAM_ID=... ZORA_PRIVATE_KEY=...
+git push heroku main
+```
+
+**Getting your Zora private key:**
+```bash
+npm install -g @zoralabs/cli --prefix ~/.local
+export PATH="$HOME/.local/bin:$PATH"
+zora setup --create
+cat ~/.config/zora/wallet.json   # copy the privateKey value
+```
+
+The bot checks for `ZORA_PRIVATE_KEY` in env first, then falls back to wallet files. So on hosted platforms, just set the env var — no file system needed.
+
 ## Updating (all options)
 
 ### VPS / Local:
