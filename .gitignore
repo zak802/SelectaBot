@@ -1,0 +1,7 @@
+.env
+node_modules/
+positions.json
+state.json
+bot.log
+bot.log.old
+*.skill
