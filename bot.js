@@ -873,6 +873,36 @@ async function scanToken(chatId, address) {
   });
 }
 
+
+// ── TP Button Pickers ─────────────────────────────────────────────────────────
+function sendTpTriggerPicker(chatId, context, current) {
+  // context: encoded string passed through to the set callback
+  const presets = [5,10,15,20,25,30,40,50,75,100,150,200];
+  const rows = [];
+  for (let i = 0; i < presets.length; i += 4) {
+    rows.push(presets.slice(i, i+4).map(p => ({
+      text: (p === current ? '✅ ' : '') + '+' + p + '%',
+      callback_data: 'tpset_pct_' + p + '_' + context
+    })));
+  }
+  bot.sendMessage(chatId, '🎯 *Set Trigger %* (current: +' + current + '%)', {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: rows }
+  });
+}
+
+function sendTpSellPicker(chatId, context, current) {
+  // After trigger is set, pick sell %
+  const presets = [10,20,25,33,50,67,75,100];
+  bot.sendMessage(chatId, '💰 *Set Sell %* (current: ' + current + '%) — how much to sell when triggered', {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: [
+      presets.slice(0,4).map(p => ({ text: (p === current ? '✅ ' : '') + p + '%', callback_data: 'tpset_sell_' + p + '_' + context })),
+      presets.slice(4).map(p => ({ text: (p === current ? '✅ ' : '') + p + '%', callback_data: 'tpset_sell_' + p + '_' + context })),
+    ]}
+  });
+}
+
 // ── Main menu ─────────────────────────────────────────────────────────────────
 function sendMainMenu(chatId) {
   const watchStatus = state.watcherEnabled ? '🟢' : '🔴';
@@ -1618,6 +1648,88 @@ bot.on('callback_query', async (query) => {
     const addr = addrFromKey(data.replace('tpr_', ''));
     if (positions[addr]) { positions[addr].customTpOrders = null; positions[addr].tpHits = new Array(state.tpOrders.length).fill(false); savePositions(positions); }
     sendCoinTpManager(chatId, addr);
+  }
+
+  // ── TP set callbacks (button-based picker results) ──
+  else if (data.startsWith('tpset_pct_')) {
+    // tpset_pct_<value>_<context>
+    const parts = data.split('_'); const pct = parseInt(parts[2]); const ctx = parts.slice(3).join('_');
+    bot.answerCallbackQuery(query.id, { text: '🎯 +' + pct + '% set' });
+    // Now show sell % picker with same context but prefixed for sell step
+    if (ctx.startsWith('g_')) {
+      const i = parseInt(ctx.replace('g_', ''));
+      sendTpSellPicker(chatId, 'gfull_' + i + '_' + pct, state.tpOrders[i]?.sellPct || 100);
+    } else if (ctx === 'ga') {
+      sendTpSellPicker(chatId, 'gafull_' + pct, 100);
+    } else if (ctx.startsWith('c_')) {
+      sendTpSellPicker(chatId, 'cfull_' + ctx.replace('c_','') + '_' + pct, 100);
+    } else if (ctx.startsWith('ca_')) {
+      const k = ctx.replace('ca_', '');
+      sendTpSellPicker(chatId, 'cafull_' + k + '_' + pct, 100);
+    }
+  }
+  else if (data.startsWith('tpset_sell_')) {
+    // tpset_sell_<value>_<context>
+    const parts = data.split('_'); const sellPct = parseInt(parts[2]); const ctx = parts.slice(3).join('_');
+    bot.answerCallbackQuery(query.id, { text: '💰 ' + sellPct + '% sell set' });
+
+    if (ctx.startsWith('gfull_')) {
+      // Edit existing global TP trigger+sell
+      const subParts = ctx.replace('gfull_','').split('_');
+      const i = parseInt(subParts[0]); const pct = parseInt(subParts[1]);
+      state.tpOrders[i] = { pct, sellPct }; state.tpOrders.sort((a,b)=>a.pct-b.pct); saveState(state);
+      bot.sendMessage(chatId, '✅ TP' + (i+1) + ' updated: +' + pct + '% → sell ' + sellPct + '%');
+      sendGlobalTpManager(chatId);
+    } else if (ctx.startsWith('gafull_')) {
+      // Add new global TP
+      const pct = parseInt(ctx.replace('gafull_',''));
+      state.tpOrders.push({ pct, sellPct }); state.tpOrders.sort((a,b)=>a.pct-b.pct); saveState(state);
+      bot.sendMessage(chatId, '✅ Added global TP: +' + pct + '% → sell ' + sellPct + '%');
+      sendGlobalTpManager(chatId);
+    } else if (ctx.startsWith('cfull_')) {
+      // Edit per-coin TP trigger+sell (ctx = cfull_<k>_<i>_<pct>)
+      const sub = ctx.replace('cfull_','').split('_');
+      const pct = parseInt(sub[sub.length-1]); const idx = parseInt(sub[sub.length-2]);
+      const k = sub.slice(0, sub.length-2).join('_');
+      const addr = addrFromKey(k);
+      if (!positions[addr].customTpOrders) positions[addr].customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
+      positions[addr].customTpOrders[idx] = { pct, sellPct };
+      positions[addr].customTpOrders.sort((a,b)=>a.pct-b.pct);
+      positions[addr].tpHits = new Array(positions[addr].customTpOrders.length).fill(false);
+      savePositions(positions);
+      bot.sendMessage(chatId, '✅ ' + positions[addr].coinName + ' TP' + (idx+1) + ': +' + pct + '% → sell ' + sellPct + '%');
+      sendCoinTpManager(chatId, addr);
+    } else if (ctx.startsWith('cafull_')) {
+      // Add per-coin TP (ctx = cafull_<k>_<pct>)
+      const sub = ctx.replace('cafull_','').split('_');
+      const pct = parseInt(sub[sub.length-1]);
+      const k = sub.slice(0, sub.length-1).join('_');
+      const addr = addrFromKey(k);
+      if (!positions[addr].customTpOrders) positions[addr].customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
+      positions[addr].customTpOrders.push({ pct, sellPct });
+      positions[addr].customTpOrders.sort((a,b)=>a.pct-b.pct);
+      positions[addr].tpHits = new Array(positions[addr].customTpOrders.length).fill(false);
+      savePositions(positions);
+      bot.sendMessage(chatId, '✅ Added TP for ' + positions[addr].coinName + ': +' + pct + '% → sell ' + sellPct + '%');
+      sendCoinTpManager(chatId, addr);
+    } else {
+      // Direct sell% edit (no trigger change)
+      if (ctx.startsWith('g_')) {
+        const i = parseInt(ctx.replace('g_',''));
+        state.tpOrders[i].sellPct = sellPct; saveState(state);
+        bot.sendMessage(chatId, '✅ TP' + (i+1) + ' sell % → ' + sellPct + '%');
+        sendGlobalTpManager(chatId);
+      } else if (ctx.startsWith('c_')) {
+        const sub = ctx.replace('c_','').split('_');
+        const i = parseInt(sub[sub.length-1]); const k = sub.slice(0,sub.length-1).join('_');
+        const addr = addrFromKey(k);
+        if (!positions[addr].customTpOrders) positions[addr].customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
+        positions[addr].customTpOrders[i].sellPct = sellPct;
+        savePositions(positions);
+        bot.sendMessage(chatId, '✅ ' + positions[addr].coinName + ' TP' + (i+1) + ' sell % → ' + sellPct + '%');
+        sendCoinTpManager(chatId, addr);
+      }
+    }
   }
 
   // ── Manual pending buys ──
