@@ -1,13 +1,14 @@
 /**
- * 🐸 Zora Combined Bot
+ * 🎵 SelectaBot — Zora Trading Bot
  * ─────────────────────────────────────────────────────────────────────────────
- * Modules:
- *   1. Group Watcher  — watches Telegram groups for Zora URLs / 0x addresses
- *   2. DCA Engine     — periodic leaderboard DCA + custom coin DCA
- *   3. Growth Engine  — TWAP-style repeated buys over time
- *   4. Position Mgr   — unified tracker with per-coin TP overrides, SL, watcher
+ * Features:
+ *   1. 👂 Listener     — group watcher, auto/manual buy
+ *   2. 📈 DCA          — basket-based DCA engine
+ *   3. 💰 Wallets      — balances, transfer, cash out
+ *   4. 📊 Positions    — grouped P&L, buy more, sell
  */
 
+'use strict';
 require('dotenv').config();
 const TelegramBot  = require('node-telegram-bot-api');
 const { execSync } = require('child_process');
@@ -15,134 +16,176 @@ const fs           = require('fs');
 const path         = require('path');
 const https        = require('https');
 
-// ── SDK (fast price fetching) ──────────────────────────────────────────────────
+// ── SDK (fast price fetching) ─────────────────────────────────────────────────
 let sdkGetCoin = null;
 try {
   const sdk = require('/home/node/.local/lib/node_modules/@zoralabs/cli/node_modules/@zoralabs/coins-sdk');
   sdkGetCoin = sdk.getCoin;
-} catch { console.log('[SDK] coins-sdk not available, falling back to CLI'); }
+} catch { /* fallback to CLI */ }
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const TOKEN            = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_ID         = parseInt(process.env.ADMIN_TELEGRAM_ID, 10);
-const BUYER_WALLET     = process.env.BUYER_WALLET_PATH;
-const DCA_WALLET       = process.env.DCA_WALLET_PATH;
-const ZORA_CLI         = path.join(process.env.HOME, '.local/bin/zora');
-const STATE_FILE       = path.join(__dirname, 'state.json');
-const POSITIONS_FILE   = path.join(__dirname, 'positions.json');
-const LOG_FILE         = path.join(__dirname, 'bot.log');
+const TOKEN          = process.env.TELEGRAM_BOT_TOKEN;
+const ADMIN_ID       = parseInt(process.env.ADMIN_TELEGRAM_ID, 10);
+const BUYER_WALLET   = process.env.BUYER_WALLET_PATH || '/home/node/.config/zora/wallet.json';
+const DCA_WALLET     = process.env.DCA_WALLET_PATH   || '/home/node/.config/zora/wallet-dca.json';
+const ZORA_CLI       = path.join(process.env.HOME, '.local/bin/zora');
+const STATE_FILE     = path.join(__dirname, 'state.json');
+const POSITIONS_FILE = path.join(__dirname, 'positions.json');
+const LOG_FILE       = path.join(__dirname, 'bot.log');
+const LOG_MAX        = 500 * 1024; // 500 KB
 
-if (!TOKEN || !ADMIN_ID) { console.error('Missing env vars'); process.exit(1); }
+if (!TOKEN || !ADMIN_ID) { console.error('Missing env: TELEGRAM_BOT_TOKEN or ADMIN_TELEGRAM_ID'); process.exit(1); }
 
-// ── Address lookup (Telegram 64-byte callback_data limit) ────────────────────
-const addrLookup = {};
-// Rebuilt from positions on startup to survive restarts
+// ── Logging ───────────────────────────────────────────────────────────────────
+function log(msg) {
+  const line = '[' + new Date().toISOString() + '] ' + msg;
+  console.log(line);
+  try {
+    try { if (fs.statSync(LOG_FILE).size > LOG_MAX) fs.renameSync(LOG_FILE, LOG_FILE + '.old'); } catch {}
+    fs.appendFileSync(LOG_FILE, line + '\n');
+  } catch {}
+}
+
+// ── Address helpers (64-byte callback_data limit) ─────────────────────────────
+const addrLookup = {};  // key -> address
+
 function addrKey(address) {
   const k = 'a' + address.slice(2, 10).toLowerCase();
-  addrLookup[k] = address;
+  addrLookup[k] = address.toLowerCase();
   return k;
 }
-function addrFromKey(k) { return addrLookup[k] || k; }
+function addrFromKey(k) {
+  return addrLookup[k] || k;
+}
+function shortId(id) { return id.slice(0, 8); }
+function findBasketByShort(sid) {
+  return (state.dca.baskets || []).find(b => b.id && b.id.startsWith(sid));
+}
+function genId() { return 'b_' + Math.random().toString(16).slice(2, 10); }
 
 // ── State ─────────────────────────────────────────────────────────────────────
 function defaultState() {
   return {
+    botName: process.env.BOT_NAME || 'SelectaBot',
     watcherEnabled: true,
     autoMode: true,
     ethAmount: 0.005,
-    buyAmountMode: 'eth', // 'eth' or 'usd'
+    buyAmountMode: 'eth',  // 'eth' or 'usd'
     stopLossPct: 20,
     watcherPriceCheckEnabled: true,
     tpOrders: [
-      { pct: 25, sellPct: 33 },
-      { pct: 50, sellPct: 33 },
+      { pct: 25,  sellPct: 33 },
+      { pct: 50,  sellPct: 33 },
       { pct: 100, sellPct: 34 },
     ],
-    dca: {
-      enabled: false,
-      intervalHours: 6,
-      ethPerCoin: 0.002,
-      maxCoins: 5,
-      minMcap: 100000,
-      minHolders: 1000,
-      slPct: 15,
-      nextDcaAt: null,
-      lastDcaAt: null,
-      customCoins: [], // [{ address, name, ethPerCycle }]
-    },
+    dca: { baskets: [] },
   };
 }
+
+function migrateState(raw) {
+  const s = { ...defaultState(), ...raw };
+  // Migrate: missing botName
+  if (!s.botName) s.botName = process.env.BOT_NAME || 'SelectaBot';
+  // Migrate: old flat DCA -> basket array
+  if (s.dca && !Array.isArray(s.dca.baskets)) {
+    const old = s.dca;
+    const basket = {
+      id: genId(),
+      name: 'Default',
+      enabled: old.enabled || false,
+      intervalMinutes: (old.intervalHours || 6) * 60,
+      ethPerCoin: old.ethPerCoin || 0.002,
+      totalBudget: null,
+      totalSpent: 0,
+      maxRuns: null,
+      runsCompleted: 0,
+      nextRunAt: old.nextDcaAt || null,
+      lastRunAt: old.lastDcaAt || null,
+      mode: 'leaderboard',
+      minMcap: old.minMcap || 100000,
+      minHolders: old.minHolders || 1000,
+      maxCoins: old.maxCoins || 5,
+      coinType: 'all',
+      lbSort: 'mcap',
+      coins: (old.customCoins || []).map(c => ({ address: c.address, name: c.name })),
+      tpOrders: s.tpOrders,
+      slPct: old.slPct || 15,
+    };
+    s.dca = { baskets: [basket] };
+    log('[migrate] Converted flat DCA -> basket: ' + basket.name);
+  }
+  // Ensure baskets have all fields
+  for (const b of (s.dca.baskets || [])) {
+    if (!b.id)              b.id = genId();
+    if (b.coinType == null) b.coinType = 'all';
+    if (b.lbSort == null)   b.lbSort = 'mcap';
+    if (!b.mode)            b.mode = 'leaderboard';
+    if (!b.coins)           b.coins = [];
+    if (!b.tpOrders)        b.tpOrders = [...s.tpOrders];
+    if (b.slPct == null)    b.slPct = 15;
+    if (b.totalSpent == null) b.totalSpent = 0;
+  }
+  return s;
+}
+
 function loadState() {
-  if (fs.existsSync(STATE_FILE)) return { ...defaultState(), ...JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) };
+  if (fs.existsSync(STATE_FILE)) {
+    try { return migrateState(JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'))); } catch {}
+  }
   return defaultState();
 }
 function saveState(s) { fs.writeFileSync(STATE_FILE, JSON.stringify(s, null, 2)); }
 let state = loadState();
 
-// Migrate old single-TP state
-if (!state.tpOrders) {
-  state.tpOrders = [{ pct: state.takeProfitPct || 25, sellPct: state.sellPct || 100 }];
-  delete state.takeProfitPct; delete state.sellPct;
-  saveState(state);
-}
-if (!state.dca) { state.dca = defaultState().dca; saveState(state); }
-
 function loadPositions() {
-  if (fs.existsSync(POSITIONS_FILE)) return JSON.parse(fs.readFileSync(POSITIONS_FILE, 'utf8'));
+  if (fs.existsSync(POSITIONS_FILE)) {
+    try { return JSON.parse(fs.readFileSync(POSITIONS_FILE, 'utf8')); } catch {}
+  }
   return {};
 }
 function savePositions(p) { fs.writeFileSync(POSITIONS_FILE, JSON.stringify(p, null, 2)); }
 let positions = loadPositions();
 
-// ── Growth Engines (in-memory) ────────────────────────────────────────────────
-// engineId -> { address, coinName, total, remaining, ethPerBuy, intervalMs, walletPath, timer }
-const activeEngines = {};
+// Rebuild addrLookup from positions on startup
+Object.keys(positions).forEach(a => addrKey(a));
 
-// ── Wizard sessions ───────────────────────────────────────────────────────────
-// chatId -> { type, step, data, createdAt }
-const sessions = {};
+// ── ETH Price Oracle ──────────────────────────────────────────────────────────
+// WETH on Base: 0x4200000000000000000000000000000000000006
+let _ethPrice = 3500;
+let _ethPriceFetchedAt = 0;
 
-// Expire stale sessions after 10 min (in case user walks away mid-wizard)
-setInterval(() => {
-  const TTL = 10 * 60 * 1000;
-  const now = Date.now();
-  let cleaned = 0;
-  for (const k of Object.keys(sessions)) {
-    if (!sessions[k].createdAt || now - sessions[k].createdAt > TTL) {
-      delete sessions[k]; cleaned++;
+async function getEthPrice() {
+  if (Date.now() - _ethPriceFetchedAt < 5 * 60 * 1000) return _ethPrice;
+  try {
+    const res = await dexFetch('https://api.dexscreener.com/latest/dex/tokens/0x4200000000000000000000000000000000000006');
+    const pairs = (res?.pairs || []).filter(p => p.chainId === 'base' && p.quoteToken?.symbol === 'USDC');
+    if (pairs[0]?.priceUsd) {
+      _ethPrice = parseFloat(pairs[0].priceUsd);
+      _ethPriceFetchedAt = Date.now();
     }
-  }
-  if (cleaned > 0) console.log('[cleanup] Expired ' + cleaned + ' stale session(s)');
-}, 5 * 60 * 1000);
+  } catch {}
+  return _ethPrice;
+}
 
-// DexScreener rate limiter: 1 req/sec to avoid 429s
+// ── DexScreener helpers ───────────────────────────────────────────────────────
+function dexFetch(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'SelectaBot/2.0' } }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+    }).on('error', reject);
+  });
+}
+
+// 1 req/sec rate limit
 let _lastDexCall = 0;
-async function dexFetchRL(url) {
+async function dexRL(url) {
   const wait = Math.max(0, 1100 - (Date.now() - _lastDexCall));
   if (wait > 0) await new Promise(r => setTimeout(r, wait));
   _lastDexCall = Date.now();
   return dexFetch(url);
 }
-
-// ── Logging ───────────────────────────────────────────────────────────────────
-const LOG_MAX_BYTES = 500 * 1024; // 500KB max log size
-function log(msg) {
-  const line = '[' + new Date().toISOString() + '] ' + msg;
-  console.log(line);
-  try {
-    // Rotate log if too large
-    try {
-      const stat = fs.statSync(LOG_FILE);
-      if (stat.size > LOG_MAX_BYTES) {
-        fs.renameSync(LOG_FILE, LOG_FILE + '.old');
-      }
-    } catch {}
-    fs.appendFileSync(LOG_FILE, line + '\n');
-  } catch {}
-}
-
-// ── Bot ───────────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TOKEN, { polling: true });
 
 // ── CLI helpers ───────────────────────────────────────────────────────────────
 function walletKey(walletPath) {
@@ -151,80 +194,99 @@ function walletKey(walletPath) {
 }
 function cliEnv(walletPath) {
   const pk = walletKey(walletPath);
-  return { ...process.env, PATH: process.env.HOME + '/.local/bin:' + process.env.PATH, ...(pk ? { ZORA_PRIVATE_KEY: pk } : {}) };
+  return {
+    ...process.env,
+    PATH: process.env.HOME + '/.local/bin:/usr/local/bin:' + process.env.PATH,
+    ...(pk ? { ZORA_PRIVATE_KEY: pk } : {}),
+  };
 }
-
-// Determine best token to spend (ETH vs $ZORA — whichever has more USD value)
-function getBestToken(walletPath) {
+function getWalletAddress(walletPath) {
   try {
-    const bal = getBalance(walletPath);
-    const tokens = bal?.wallet || [];
-    const eth  = tokens.find(t => t.symbol === 'ETH');
-    const zora = tokens.find(t => t.symbol === 'ZORA' || t.symbol === 'zora');
-    if (zora && parseFloat(zora.usdValue || 0) > parseFloat(eth?.usdValue || 0)) {
-      log('[token] Using $ZORA (\$' + parseFloat(zora.usdValue).toFixed(2) + ' vs ETH \$' + parseFloat(eth?.usdValue||0).toFixed(2) + ')');
-      return 'zora';
-    }
-    return 'eth';
-  } catch { return 'eth'; }
+    const w = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
+    if (w.address) return w.address;
+    const out = execSync(ZORA_CLI + ' wallet info --json', { env: cliEnv(walletPath) }).toString();
+    return JSON.parse(out).address || null;
+  } catch { return null; }
 }
-
 function executeBuy(address, eth, walletPath) {
   try {
-    const token = getBestToken(walletPath);
-    const cmd = ZORA_CLI + ' buy ' + address + ' --eth ' + eth + ' --token ' + token + ' --yes --json';
-    const out = execSync(cmd, { env: cliEnv(walletPath) }).toString();
-    return { success: true, data: JSON.parse(out), token };
+    const out = execSync(ZORA_CLI + ' buy ' + address + ' --eth ' + eth + ' --yes --json',
+      { env: cliEnv(walletPath), timeout: 60000 }).toString();
+    return { success: true, data: JSON.parse(out) };
   } catch (e) { return { success: false, error: e.message.slice(0, 200) }; }
 }
 function executeSell(address, pct, walletPath) {
   try {
-    const out = execSync(ZORA_CLI + ' sell ' + address + ' --percent ' + pct + ' --yes --json', { env: cliEnv(walletPath) }).toString();
+    const out = execSync(ZORA_CLI + ' sell ' + address + ' --percent ' + pct + ' --yes --json',
+      { env: cliEnv(walletPath), timeout: 60000 }).toString();
+    return { success: true, data: JSON.parse(out) };
+  } catch (e) { return { success: false, error: e.message.slice(0, 200) }; }
+}
+function executeTransfer(fromWalletPath, toAddress, ethAmount) {
+  try {
+    const pk = walletKey(fromWalletPath);
+    if (!pk) throw new Error('No private key in wallet file');
+    const wei = BigInt(Math.round(parseFloat(ethAmount) * 1e18)).toString();
+    const out = execSync(
+      'cast send --private-key ' + pk + ' --value ' + wei + ' ' + toAddress +
+      ' --rpc-url https://mainnet.base.org --json',
+      { env: { ...process.env, PATH: process.env.HOME + '/.local/bin:/usr/local/bin:' + process.env.PATH }, timeout: 60000 }
+    ).toString();
     return { success: true, data: JSON.parse(out) };
   } catch (e) { return { success: false, error: e.message.slice(0, 200) }; }
 }
 function getBalance(walletPath) {
   try {
-    const out = execSync(ZORA_CLI + ' balance --json', { env: cliEnv(walletPath) }).toString();
+    const out = execSync(ZORA_CLI + ' balance --json', { env: cliEnv(walletPath), timeout: 30000 }).toString();
     return JSON.parse(out);
   } catch { return null; }
 }
 
-// ── Price fetching (SDK fast path, CLI fallback) ──────────────────────────────
+// ── Price fetching ────────────────────────────────────────────────────────────
 async function fetchPrice(address) {
   if (sdkGetCoin) {
     try {
       const r = await sdkGetCoin({ address });
       const c = r?.data?.zora20Token;
-      if (c) return { name: c.name, priceUsd: parseFloat(c.marketCap || 0) / 1e9, marketCap: parseFloat(c.marketCap || 0), uniqueHolders: c.uniqueHolders };
+      if (c) return {
+        name: c.name, priceUsd: parseFloat(c.marketCap || 0) / 1e9,
+        marketCap: parseFloat(c.marketCap || 0), uniqueHolders: c.uniqueHolders,
+      };
     } catch {}
   }
-  // CLI fallback
   try {
-    const out = execSync(ZORA_CLI + ' get ' + address + ' --json', { env: cliEnv(BUYER_WALLET) }).toString();
+    const out = execSync(ZORA_CLI + ' get ' + address + ' --json',
+      { env: cliEnv(BUYER_WALLET), timeout: 20000 }).toString();
     const d = JSON.parse(out);
     const priceUsd = d.priceUsd || (parseFloat(d.marketCap || 0) / 1e9);
     return { name: d.name, priceUsd, marketCap: parseFloat(d.marketCap || 0), uniqueHolders: d.uniqueHolders };
   } catch { return null; }
 }
-async function fetchPriceBulk(addresses) {
-  const results = await Promise.all(addresses.map(a => fetchPrice(a)));
-  const map = {};
-  addresses.forEach((a, i) => { map[a] = results[i]; });
-  return map;
-}
 
 // ── URL / address detection ───────────────────────────────────────────────────
-const ZORA_RE   = /https?:\/\/(?:www\.)?zora\.co\/(?:coin\/(0x[a-fA-F0-9]{40})|collect\/base:(0x[a-fA-F0-9]{40}))/g;
-const ADDR_RE   = /(?:^|\s)(0x[a-fA-F0-9]{40})(?:\s|$)/gm;
+const ZORA_RE = /https?:\/\/(?:www\.)?zora\.co\/(?:coin\/(0x[a-fA-F0-9]{40})|collect\/base:(0x[a-fA-F0-9]{40}))/g;
+const ADDR_RE = /(?:^|\s)(0x[a-fA-F0-9]{40})(?:\s|$)/gm;
+
 function extractAddresses(text) {
-  const addrs = []; let m;
-  const u = new RegExp(ZORA_RE.source, 'g');
-  while ((m = u.exec(text)) !== null) addrs.push(m[1] || m[2]);
-  const a = new RegExp(ADDR_RE.source, 'gm');
-  while ((m = a.exec(text)) !== null) addrs.push(m[1]);
-  return [...new Set(addrs)];
+  const out = []; let m;
+  const uz = new RegExp(ZORA_RE.source, 'g');
+  while ((m = uz.exec(text)) !== null) out.push((m[1] || m[2]).toLowerCase());
+  const ua = new RegExp(ADDR_RE.source, 'gm');
+  while ((m = ua.exec(text)) !== null) out.push(m[1].toLowerCase());
+  return [...new Set(out)];
 }
+
+// ── Session management ────────────────────────────────────────────────────────
+const sessions = {};
+const SESSION_TTL = 10 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now(); let n = 0;
+  for (const k of Object.keys(sessions)) {
+    if (!sessions[k].createdAt || now - sessions[k].createdAt > SESSION_TTL) { delete sessions[k]; n++; }
+  }
+  if (n > 0) log('[cleanup] Expired ' + n + ' session(s)');
+}, 5 * 60 * 1000);
 
 // ── Position helpers ──────────────────────────────────────────────────────────
 function getEffectiveTps(pos) { return pos.customTpOrders || state.tpOrders; }
@@ -232,276 +294,200 @@ function ensureTpHits(pos) {
   const tps = getEffectiveTps(pos);
   if (!pos.tpHits || pos.tpHits.length !== tps.length) pos.tpHits = new Array(tps.length).fill(false);
 }
+function posWallet(pos) {
+  if (pos.source && pos.source.startsWith('b_')) return DCA_WALLET;
+  return BUYER_WALLET;
+}
 
-// ── Buy flow (group watcher) ──────────────────────────────────────────────────
-async function handleGroupBuy(address, groupName, fromUser) {
-  const coin = await fetchPrice(address);
-  const coinName = coin?.name || address.slice(0, 10) + '...';
-  const buyPriceUsd = coin?.priceUsd || null;
-  const tpSummary = state.tpOrders.map((t, i) => 'TP' + (i+1) + ': +' + t.pct + '% sell ' + t.sellPct + '%').join(' | ');
+// ── USD/ETH helpers ───────────────────────────────────────────────────────────
+async function ethFromAmount(ethAmount) {
+  // ethAmount is always stored in ETH; USD mode just controls display
+  return parseFloat(ethAmount);
+}
+async function usdLabel(eth) {
+  const price = await getEthPrice();
+  return '$' + (eth * price).toFixed(2);
+}
+async function buyAmountLine() {
+  const eth = state.ethAmount;
+  if (state.buyAmountMode === 'usd') {
+    const usd = await usdLabel(eth);
+    return usd + ' (~' + eth.toFixed(5) + ' ETH)';
+  }
+  const usd = await usdLabel(eth);
+  return eth + ' ETH (~' + usd + ')';
+}
 
-  log('Group buy: ' + coinName + ' from ' + fromUser + ' in ' + groupName);
+// ── Bot instance ──────────────────────────────────────────────────────────────
+const bot = new TelegramBot(TOKEN, { polling: true });
 
-  if (state.autoMode) {
-    const result = executeBuy(address, state.ethAmount, BUYER_WALLET);
-    if (result.success) {
-      const tx = result.data?.txHash || result.data?.transactionHash || 'pending';
-      positions[address] = {
-        coinName, address, buyPriceUsd, boughtAt: Date.now(),
-        ethSpent: state.ethAmount, source: 'watcher',
-        tpHits: new Array(state.tpOrders.length).fill(false),
-        customTpOrders: null, fullyExited: false,
-      };
-      savePositions(positions);
-      addrKey(address); // register in lookup
-      bot.sendMessage(ADMIN_ID,
-        '🛒 *Bought ' + coinName + '*\n' + state.ethAmount + ' ETH\n' + tpSummary + '\nSL: -' + state.stopLossPct + '%\nTx: `' + tx + '`\nFrom @' + fromUser + ' in ' + (groupName || 'group'),
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [
-          [{ text: '⚙️ Configure ' + coinName, callback_data: 'pd_' + addrKey(address) }],
-          [{ text: '📊 Positions', callback_data: 'positions' }],
-        ]}}
-      );
-      log('Bought ' + coinName + ' tx:' + tx);
-    } else {
-      bot.sendMessage(ADMIN_ID, '❌ Buy failed: *' + coinName + '*\n`' + result.error + '`', { parse_mode: 'Markdown' });
-      log('Buy failed ' + coinName + ': ' + result.error);
-    }
-  } else {
-    const key = 'pend_' + Date.now();
-    sessions[key] = { address, coinName, buyPriceUsd };
-    bot.sendMessage(ADMIN_ID,
-      '🔔 *' + coinName + '* shared in ' + (groupName || 'group') + '\nBy @' + fromUser + '\nBuy for *' + state.ethAmount + ' ETH*?',
-      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
-        { text: '✅ Buy', callback_data: 'pby_' + key },
-        { text: '❌ Skip', callback_data: 'psk_' + key },
-      ]]}}
-    );
+// ── DCA Basket Engine ─────────────────────────────────────────────────────────
+async function getLeaderboard(basket) {
+  try {
+    const sortFlag = basket.lbSort === 'volume' ? '--sort volume' :
+                     basket.lbSort === 'holders' ? '--sort holders' : '--sort mcap';
+    const coinTypeFlag = basket.coinType === 'zora' ? '--platform zora' :
+                         basket.coinType === 'virtuals' ? '--platform virtuals' : '';
+    const cmd = ZORA_CLI + ' explore ' + sortFlag + ' ' + coinTypeFlag + ' --json';
+    const out = execSync(cmd, { env: cliEnv(DCA_WALLET), timeout: 30000 }).toString();
+    const all = JSON.parse(out).coins || [];
+    return all.filter(c =>
+      (c.marketCap || 0) >= basket.minMcap &&
+      (c.uniqueHolders || 0) >= basket.minHolders &&
+      !c.platformBlocked
+    ).slice(0, basket.maxCoins);
+  } catch (e) {
+    log('[dca] Leaderboard fetch failed: ' + e.message);
+    return [];
   }
 }
 
-// ── DCA cycle ─────────────────────────────────────────────────────────────────
-async function runDcaCycle() {
-  if (!state.dca.enabled) return;
-  log('=== DCA CYCLE START ===');
-  bot.sendMessage(ADMIN_ID, '🔄 *DCA cycle starting...*', { parse_mode: 'Markdown' });
+async function runBasket(basket) {
+  log('[dca] Running basket: ' + basket.name);
+  const lines = [];
 
-  const bal = getBalance(DCA_WALLET);
-  const ethBal = parseFloat(bal?.wallet?.[0]?.balance || '0');
-  log('DCA wallet balance: ' + ethBal + ' ETH');
-
-  if (ethBal <= 0) {
-    bot.sendMessage(ADMIN_ID, '⚠️ DCA wallet empty! Top up: `' + (JSON.parse(fs.readFileSync(DCA_WALLET)).address) + '`', { parse_mode: 'Markdown' });
+  // Budget check
+  if (basket.totalBudget !== null && basket.totalSpent >= basket.totalBudget) {
+    log('[dca] Basket ' + basket.name + ' budget exhausted');
+    basket.enabled = false;
+    saveState(state);
+    bot.sendMessage(ADMIN_ID, '💸 *' + basket.name + '* budget exhausted — basket paused.', { parse_mode: 'Markdown' });
+    return;
+  }
+  // Max runs check
+  if (basket.maxRuns !== null && basket.runsCompleted >= basket.maxRuns) {
+    log('[dca] Basket ' + basket.name + ' max runs reached');
+    basket.enabled = false;
+    saveState(state);
+    bot.sendMessage(ADMIN_ID, '🏁 *' + basket.name + '* max runs reached — basket paused.', { parse_mode: 'Markdown' });
     return;
   }
 
-  // ── Leaderboard coins ──
-  let leaderboardCoins = [];
-  try {
-    const out = execSync(ZORA_CLI + ' explore --sort mcap --json', { env: cliEnv(DCA_WALLET) }).toString();
-    const all = JSON.parse(out).coins || [];
-    leaderboardCoins = all
-      .filter(c => c.marketCap >= state.dca.minMcap && c.uniqueHolders >= state.dca.minHolders && !c.platformBlocked)
-      .slice(0, state.dca.maxCoins);
-  } catch (e) { log('Leaderboard fetch failed: ' + e.message); }
+  let coinsToBuy = [];
+  if (basket.mode === 'leaderboard') {
+    const lb = await getLeaderboard(basket);
+    coinsToBuy = lb.map(c => ({ address: c.address, name: c.name, priceUsd: c.priceUsd }));
+  } else {
+    // Specific coins mode
+    coinsToBuy = (basket.coins || []).map(c => ({ address: c.address, name: c.name, priceUsd: null }));
+  }
 
-  // ── Custom coins ──
-  const customCoins = state.dca.customCoins || [];
-
-  const allToBuy = [
-    ...leaderboardCoins.map(c => ({ address: c.address, name: c.name, eth: state.dca.ethPerCoin, priceUsd: c.priceUsd })),
-    ...customCoins.map(c => ({ address: c.address, name: c.name, eth: c.ethPerCycle, priceUsd: null })),
-  ];
-
-  if (allToBuy.length === 0) {
-    bot.sendMessage(ADMIN_ID, '⚠️ No coins to DCA into this cycle.');
+  if (!coinsToBuy.length) {
+    bot.sendMessage(ADMIN_ID, '⚠️ *' + basket.name + '*: no coins to buy this cycle.', { parse_mode: 'Markdown' });
     return;
   }
 
-  const summary = [];
-  for (const coin of allToBuy) {
-    if (ethBal < coin.eth) { summary.push('⚠️ ' + coin.name + ' (insufficient balance)'); continue; }
-    log('DCA buying ' + coin.name + ' for ' + coin.eth + ' ETH');
-    const result = executeBuy(coin.address, coin.eth, DCA_WALLET);
-    if (result.success) {
-      const tx = result.data?.txHash || result.data?.transactionHash || 'pending';
+  const balRaw = getBalance(DCA_WALLET);
+  const bal = parseFloat(balRaw?.wallet?.[0]?.balance || '0');
+
+  for (const coin of coinsToBuy) {
+    const eth = basket.ethPerCoin;
+    if (bal < eth * 0.99) { lines.push('⚠️ ' + coin.name + ' (low balance)'); continue; }
+    // Budget cap
+    const remaining = basket.totalBudget !== null ? basket.totalBudget - basket.totalSpent : Infinity;
+    if (eth > remaining) { lines.push('⚠️ ' + coin.name + ' (over budget)'); continue; }
+
+    const r = executeBuy(coin.address, eth, DCA_WALLET);
+    if (r.success) {
+      const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
       addrKey(coin.address);
+      basket.totalSpent = (basket.totalSpent || 0) + eth;
       if (!positions[coin.address]) {
         positions[coin.address] = {
           coinName: coin.name, address: coin.address,
           buyPriceUsd: coin.priceUsd, avgBuyPrice: coin.priceUsd,
-          totalEthSpent: coin.eth, buyCount: 1,
-          boughtAt: Date.now(), source: 'dca',
-          tpHits: new Array(state.tpOrders.length).fill(false),
+          boughtAt: Date.now(), ethSpent: eth, source: basket.id,
+          tpHits: new Array(basket.tpOrders.length).fill(false),
           customTpOrders: null, fullyExited: false,
         };
       } else {
         const pos = positions[coin.address];
-        if (pos.avgBuyPrice && coin.priceUsd) {
-          const total = pos.totalEthSpent + coin.eth;
-          pos.avgBuyPrice = ((pos.avgBuyPrice * pos.totalEthSpent) + (coin.priceUsd * coin.eth)) / total;
-          pos.totalEthSpent = total;
+        const pp = pos.avgBuyPrice || pos.buyPriceUsd;
+        if (pp && coin.priceUsd) {
+          const tot = (pos.ethSpent || 0) + eth;
+          pos.avgBuyPrice = ((pp * (pos.ethSpent || 0)) + (coin.priceUsd * eth)) / tot;
         }
-        pos.buyCount = (pos.buyCount || 1) + 1;
+        pos.ethSpent = (pos.ethSpent || 0) + eth;
+        if (!pos.source || pos.source !== basket.id) pos.source = basket.id;
       }
       savePositions(positions);
-      summary.push('✅ ' + coin.name + ' @$' + (coin.priceUsd?.toFixed(6) || '?'));
-      log('DCA bought ' + coin.name + ' tx:' + tx);
+      lines.push('✅ ' + coin.name + ' @' + (coin.priceUsd ? '$' + coin.priceUsd.toFixed(6) : '?'));
+      log('[dca] Bought ' + coin.name + ' tx:' + tx);
     } else {
-      summary.push('❌ ' + coin.name + ' (failed)');
-      log('DCA buy failed ' + coin.name + ': ' + result.error);
+      lines.push('❌ ' + coin.name + ' (failed)');
+      log('[dca] Buy failed ' + coin.name + ': ' + r.error);
     }
   }
 
-  state.dca.lastDcaAt = Date.now();
-  state.dca.nextDcaAt = Date.now() + state.dca.intervalHours * 3600000;
+  basket.runsCompleted = (basket.runsCompleted || 0) + 1;
+  basket.lastRunAt = Date.now();
+  basket.nextRunAt = Date.now() + basket.intervalMinutes * 60000;
   saveState(state);
+  savePositions(positions);
 
+  const nextStr = new Date(basket.nextRunAt).toUTCString().slice(0, 25);
   bot.sendMessage(ADMIN_ID,
-    '✅ *DCA Cycle Complete*\n\n' + summary.join('\n') + '\n\nNext: ' + new Date(state.dca.nextDcaAt).toUTCString(),
+    '✅ *' + basket.name + '* cycle complete\n\n' + lines.join('\n') + '\n\nNext: ' + nextStr,
     { parse_mode: 'Markdown' }
   );
-  log('=== DCA CYCLE END ===');
 }
 
-// DCA interval timer
-let dcaTimer = null;
-function scheduleDca() {
-  if (dcaTimer) clearInterval(dcaTimer);
-  dcaTimer = setInterval(() => {
-    if (state.dca.enabled) runDcaCycle();
-  }, state.dca.intervalHours * 3600000);
-}
-scheduleDca();
-
-// ── Growth Engine ─────────────────────────────────────────────────────────────
-// Randomize a value by ±variance (0.15 = ±15%)
-function jitter(value, variance) {
-  const factor = 1 + (Math.random() * 2 - 1) * variance;
-  return Math.max(0.0001, value * factor);
-}
-
-function startGrowthEngine(engineId, address, coinName, totalBuys, ethPerBuy, intervalMs, variance) {
-  const v = (variance !== undefined) ? variance : 0.15; // default ±15%
-  const engine = { address, coinName, total: totalBuys, remaining: totalBuys, ethPerBuy, intervalMs, variance: v, done: 0, totalSpent: 0 };
-  activeEngines[engineId] = engine;
-
-  function doBuy() {
-    if (!activeEngines[engineId]) return; // cancelled
-    const eng = activeEngines[engineId];
-    if (eng.remaining <= 0) {
-      bot.sendMessage(ADMIN_ID, '🏁 *Growth Engine Complete!*\n*' + eng.coinName + '*\nActual spent: ' + eng.totalSpent.toFixed(5) + ' ETH over ' + eng.total + ' buys', { parse_mode: 'Markdown' });
-      delete activeEngines[engineId];
-      return;
-    }
-    // Randomize amount and interval
-    const thisEth = parseFloat(jitter(eng.ethPerBuy, eng.variance).toFixed(5));
-    const nextInterval = Math.round(jitter(eng.intervalMs, eng.variance));
-    const current = eng.total - eng.remaining + 1;
-
-    log('[growth] Buy ' + current + '/' + eng.total + ' ' + eng.coinName + ' ' + thisEth + ' ETH (next in ' + Math.round(nextInterval/1000) + 's)');
-    const result = executeBuy(eng.address, thisEth, BUYER_WALLET);
-
-    if (result.success) {
-      const tx = result.data?.txHash || result.data?.transactionHash || 'pending';
-      eng.remaining--;
-      eng.done++;
-      eng.totalSpent += thisEth;
-      addrKey(eng.address);
-
-      // Fetch price for P&L tracking (async, don't block)
-      fetchPrice(eng.address).then(priceData => {
-        const currentPrice = priceData?.priceUsd || null;
-        if (!positions[eng.address]) {
-          positions[eng.address] = {
-            coinName: eng.coinName, address: eng.address,
-            buyPriceUsd: currentPrice,
-            avgBuyPrice: currentPrice,
-            boughtAt: Date.now(),
-            ethSpent: thisEth, source: 'growth',
-            tpHits: new Array(state.tpOrders.length).fill(false),
-            customTpOrders: null, fullyExited: false,
-          };
-        } else {
-          const pos = positions[eng.address];
-          // DCA-average the buy price
-          if (currentPrice && pos.avgBuyPrice) {
-            const totalEth = pos.ethSpent + thisEth;
-            pos.avgBuyPrice = ((pos.avgBuyPrice * pos.ethSpent) + (currentPrice * thisEth)) / totalEth;
-          } else if (currentPrice && !pos.avgBuyPrice) {
-            pos.avgBuyPrice = currentPrice;
-            pos.buyPriceUsd = currentPrice;
-          }
-          pos.ethSpent = (pos.ethSpent || 0) + thisEth;
-        }
-        savePositions(positions);
-      }).catch(() => {
-        // Price fetch failed — still track position without price
-        if (!positions[eng.address]) {
-          positions[eng.address] = {
-            coinName: eng.coinName, address: eng.address,
-            buyPriceUsd: null, avgBuyPrice: null,
-            boughtAt: Date.now(), ethSpent: thisEth, source: 'growth',
-            tpHits: new Array(state.tpOrders.length).fill(false),
-            customTpOrders: null, fullyExited: false,
-          };
-        } else {
-          positions[eng.address].ethSpent = (positions[eng.address].ethSpent || 0) + thisEth;
-        }
-        savePositions(positions);
-      });
-      savePositions(positions);
-      bot.sendMessage(ADMIN_ID, '⚡ Growth ' + current + '/' + eng.total + ' *' + eng.coinName + '* ✅\n' + thisEth + ' ETH | Tx: `' + tx + '`', { parse_mode: 'Markdown' });
-    } else {
-      bot.sendMessage(ADMIN_ID, '❌ Growth buy ' + current + '/' + eng.total + ' failed: `' + result.error + '`', { parse_mode: 'Markdown' });
-      eng.remaining--;
-    }
-    if (eng.remaining > 0 && activeEngines[engineId]) {
-      eng.timer = setTimeout(doBuy, nextInterval);
-    } else if (eng.remaining <= 0) {
-      bot.sendMessage(ADMIN_ID, '🏁 *Growth Engine Complete!*\n*' + eng.coinName + '*\nActual spent: ' + eng.totalSpent.toFixed(5) + ' ETH', { parse_mode: 'Markdown' });
-      delete activeEngines[engineId];
+// Per-minute basket ticker
+setInterval(async () => {
+  const now = Date.now();
+  for (const basket of (state.dca.baskets || [])) {
+    if (!basket.enabled) continue;
+    if (!basket.nextRunAt || now >= basket.nextRunAt) {
+      await runBasket(basket);
     }
   }
+}, 60 * 1000);
 
-  activeEngines[engineId].timer = setTimeout(doBuy, 100); // start immediately
-}
-
-// ── Price Watcher ─────────────────────────────────────────────────────────────
+// ── Price Watcher (5 min) ─────────────────────────────────────────────────────
 setInterval(async () => {
   if (!state.watcherPriceCheckEnabled) return;
   const addrs = Object.keys(positions).filter(a => !positions[a].fullyExited);
   if (!addrs.length) return;
-  log('[watcher] Checking ' + addrs.length + ' positions');
+  log('[watcher] Checking ' + addrs.length + ' position(s)');
 
-  const priceMap = await fetchPriceBulk(addrs);
+  const ethPrice = await getEthPrice();
 
   for (const address of addrs) {
     const pos = positions[address];
     const ref = pos.avgBuyPrice || pos.buyPriceUsd;
     if (!ref) continue;
-    const coin = priceMap[address];
+    let coin;
+    try { coin = await fetchPrice(address); } catch { continue; }
     if (!coin?.priceUsd) continue;
 
     const chg = ((coin.priceUsd - ref) / ref) * 100;
-    const chgStr = (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%';
     const activeTps = getEffectiveTps(pos);
     ensureTpHits(pos);
-    const slPct = pos.source === 'dca' ? state.dca.slPct : state.stopLossPct;
+    const wallet = posWallet(pos);
 
-    // Fire TPs
+    // Get basket SL if applicable
+    let slPct = state.stopLossPct;
+    if (pos.source && pos.source.startsWith('b_')) {
+      const basket = (state.dca.baskets || []).find(b => b.id === pos.source);
+      if (basket) slPct = basket.slPct;
+    }
+
+    // Trigger TPs
     for (let i = 0; i < activeTps.length; i++) {
       if (pos.tpHits[i]) continue;
       if (chg >= activeTps[i].pct) {
-        bot.sendMessage(ADMIN_ID, '🟢 *TP' + (i+1) + ' triggered!* ' + pos.coinName + ' ' + chgStr + '\nSelling ' + activeTps[i].sellPct + '%...', { parse_mode: 'Markdown' });
-        const walletPath = pos.source === 'dca' ? DCA_WALLET : BUYER_WALLET;
-        const r = executeSell(address, activeTps[i].sellPct, walletPath);
+        log('[watcher] TP' + (i+1) + ' hit: ' + pos.coinName + ' +' + chg.toFixed(1) + '%');
+        bot.sendMessage(ADMIN_ID,
+          '🟢 *TP' + (i+1) + ' hit!* ' + pos.coinName + ' +' + chg.toFixed(1) + '%\nSelling ' + activeTps[i].sellPct + '%...',
+          { parse_mode: 'Markdown' });
+        const r = executeSell(address, activeTps[i].sellPct, wallet);
         if (r.success) {
           pos.tpHits[i] = true;
           const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
-          bot.sendMessage(ADMIN_ID, '✅ TP' + (i+1) + ' sold ' + activeTps[i].sellPct + '% of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
           if (i === activeTps.length - 1) pos.fullyExited = true;
+          bot.sendMessage(ADMIN_ID, '✅ TP' + (i+1) + ' sold ' + activeTps[i].sellPct + '% *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
         } else {
-          bot.sendMessage(ADMIN_ID, '❌ TP' + (i+1) + ' sell failed: *' + pos.coinName + '*\n`' + r.error + '`', { parse_mode: 'Markdown' });
+          bot.sendMessage(ADMIN_ID, '❌ TP sell failed: *' + pos.coinName + '*\n`' + r.error + '`', { parse_mode: 'Markdown' });
         }
         break;
       }
@@ -509,1265 +495,1795 @@ setInterval(async () => {
 
     // Stop loss
     if (!pos.fullyExited && chg <= -Math.abs(slPct)) {
-      bot.sendMessage(ADMIN_ID, '🔴 *Stop-Loss!* ' + pos.coinName + ' ' + chgStr + '\nSelling 100%...', { parse_mode: 'Markdown' });
-      const walletPath = pos.source === 'dca' ? DCA_WALLET : BUYER_WALLET;
-      const r = executeSell(address, 100, walletPath);
+      log('[watcher] SL hit: ' + pos.coinName + ' ' + chg.toFixed(1) + '%');
+      bot.sendMessage(ADMIN_ID, '🔴 *Stop-Loss!* ' + pos.coinName + ' ' + chg.toFixed(1) + '%\nSelling 100%...', { parse_mode: 'Markdown' });
+      const r = executeSell(address, 100, wallet);
       if (r.success) {
         pos.fullyExited = true;
         const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
         bot.sendMessage(ADMIN_ID, '✅ SL exit *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+      } else {
+        bot.sendMessage(ADMIN_ID, '❌ SL sell failed: *' + pos.coinName + '*\n`' + r.error + '`', { parse_mode: 'Markdown' });
       }
     }
-
     savePositions(positions);
+
+    // Rate limit: small delay between coins
+    await new Promise(r => setTimeout(r, 1200));
   }
 }, 5 * 60 * 1000);
 
-// ── Group message handler ─────────────────────────────────────────────────────
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-  const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
-  const isAdmin = msg.from.id === ADMIN_ID;
-  const text = msg.text || msg.caption || '';
+// ── Group Watcher ─────────────────────────────────────────────────────────────
+async function handleGroupBuy(address, groupName, fromUser) {
+  if (!state.watcherEnabled) return;
+  // Don't rebuy fully exited positions unless manually
+  if (positions[address]?.fullyExited) return;
 
-  if (msg.chat.type === 'private') {
-    if (!isAdmin) { bot.sendMessage(chatId, '⛔ Unauthorized.'); return; }
-    handleAdminMessage(msg);
-    return;
-  }
+  const coin = await fetchPrice(address);
+  const coinName = coin?.name || address.slice(0, 10) + '...';
+  const buyPriceUsd = coin?.priceUsd || null;
+  const ethAmt = state.ethAmount;
+  const tpSummary = state.tpOrders.map((t, i) => 'TP' + (i+1) + ':+' + t.pct + '%→' + t.sellPct + '%').join(' ');
 
-  if (!isGroup || !state.watcherEnabled) return;
-  const addrs = extractAddresses(text);
-  for (const a of addrs) {
-    await handleGroupBuy(a, msg.chat.title, msg.from.username || msg.from.first_name);
-  }
-});
+  log('[watcher] Coin spotted: ' + coinName + ' from ' + fromUser + ' in ' + (groupName || 'group'));
 
-// ── Admin DM message handler ──────────────────────────────────────────────────
-function handleAdminMessage(msg) {
-  const chatId = msg.chat.id;
-  const text = msg.text || '';
-
-  // ── Active wizard ──
-  const sess = sessions[chatId];
-  if (sess && !text.startsWith('/')) {
-    handleWizardInput(chatId, text, sess);
-    return;
-  }
-  if (sess && text.startsWith('/')) { delete sessions[chatId]; } // cancel wizard on /cmd
-
-  // ── Commands ──
-  // ── Raw address scan (no wizard active, not a command) ──
-  const rawAddr = text.trim().match(/^(0x[a-fA-F0-9]{40})$/);
-  if (rawAddr) { scanToken(chatId, rawAddr[1]); return; }
-
-  if (text === '/start' || text === '/admin') { sendMainMenu(chatId); }
-  else if (text === '/positions') { sendPositionsList(chatId); }
-  else if (text === '/balance') { sendBalanceMsg(chatId); }
-  else if (text === '/cancel') { delete sessions[chatId]; bot.sendMessage(chatId, '✅ Cancelled.'); sendMainMenu(chatId); }
-  else if (text === '/runnow') { bot.sendMessage(chatId, '⚡ Running DCA now...'); runDcaCycle(); }
-  else { sendMainMenu(chatId); }
-}
-
-// ── Wizard input handler ──────────────────────────────────────────────────────
-async function handleWizardInput(chatId, text, sess) {
-  const val = text.trim();
-
-  // ── Set buy amount wizard ──
-  if (sess.type === 'set_buy_amount') {
-    let eth;
-    if (val.startsWith('$')) {
-      const usd = parseFloat(val.replace('$', ''));
-      if (isNaN(usd) || usd <= 0) { bot.sendMessage(chatId, '❌ Enter a valid amount (e.g. `0.01` or `$10`):'); return; }
-      eth = parseFloat((usd / cachedEthPrice).toFixed(5));
-      state.buyAmountMode = 'usd';
-      bot.sendMessage(chatId, '✅ Buy amount → ~$' + usd + ' (' + eth + ' ETH)', { parse_mode: 'Markdown' });
-    } else {
-      eth = parseFloat(val);
-      if (isNaN(eth) || eth <= 0) { bot.sendMessage(chatId, '❌ Enter a valid amount (e.g. `0.01` or `$10`):'); return; }
-      state.buyAmountMode = 'eth';
-      bot.sendMessage(chatId, '✅ Buy amount → ' + eth + ' ETH');
-    }
-    state.ethAmount = eth;
-    saveState(state);
-    delete sessions[chatId];
-    sendWatcherPanel(chatId);
-    return;
-  }
-
-  // ── Growth engine wizard ──
-  if (sess.type === 'growth') {
-    if (sess.step === 'address') {
-      const addr = val.match(/0x[a-fA-F0-9]{40}/)?.[0];
-      if (!addr) { bot.sendMessage(chatId, '❌ Invalid address. Enter a valid 0x address:'); return; }
-      sess.data.address = addr;
-      const coin = await fetchPrice(addr);
-      sess.data.coinName = coin?.name || addr.slice(0, 10) + '...';
-      sess.step = 'total_eth';
-      const buyerBal = getBalance(BUYER_WALLET);
-      const availEth = parseFloat(buyerBal?.wallet?.[0]?.balance || '0').toFixed(4);
-      bot.sendMessage(chatId, '🚀 *Growth Engine — ' + sess.data.coinName + '*\n\n💰 Buyer wallet: *' + availEth + ' ETH* available\n\nTotal ETH to spend:', {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: [
-          [{ text: '0.005', callback_data: 'geth_v0.005' }, { text: '0.01', callback_data: 'geth_v0.01' }, { text: '0.02', callback_data: 'geth_v0.02' }, { text: '0.05', callback_data: 'geth_v0.05' }],
-          [{ text: '0.1', callback_data: 'geth_v0.1' }, { text: '0.5', callback_data: 'geth_v0.5' }, { text: '✏️ Custom', callback_data: 'geth_custom' }],
-        ]}
-      });
-    } else if (sess.step === 'total_eth') {
-      const v = parseFloat(val);
-      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter a valid ETH amount:'); return; }
-      sess.data.totalEth = v;
-      sess.step = 'num_buys';
-      bot.sendMessage(chatId, 'Number of buys:', {
-        reply_markup: { inline_keyboard: [
-          [{ text: '3', callback_data: 'gbuys_3' }, { text: '5', callback_data: 'gbuys_5' }, { text: '10', callback_data: 'gbuys_10' }, { text: '20', callback_data: 'gbuys_20' }],
-          [{ text: '30', callback_data: 'gbuys_30' }, { text: '50', callback_data: 'gbuys_50' }, { text: '✏️ Custom', callback_data: 'gbuys_custom' }],
-        ]}
-      });
-    } else if (sess.step === 'num_buys') {
-      const v = parseInt(val);
-      if (isNaN(v) || v < 1) { bot.sendMessage(chatId, '❌ Enter a valid number:'); return; }
-      sess.data.numBuys = v;
-      sess.step = 'interval';
-      bot.sendMessage(chatId, 'Interval between buys:', {
-        reply_markup: { inline_keyboard: [
-          [{ text: '30s', callback_data: 'gint_0.5' }, { text: '1 min', callback_data: 'gint_1' }, { text: '2 min', callback_data: 'gint_2' }, { text: '5 min', callback_data: 'gint_5' }],
-          [{ text: '10 min', callback_data: 'gint_10' }, { text: '30 min', callback_data: 'gint_30' }, { text: '1 hour', callback_data: 'gint_60' }, { text: '✏️ Custom', callback_data: 'gint_custom' }],
-        ]}
-      });
-    } else if (sess.step === 'interval') {
-      const v = parseFloat(val);
-      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter a valid number:'); return; }
-      sess.data.intervalMin = v;
-      const ethPerBuy = (sess.data.totalEth / sess.data.numBuys).toFixed(5);
-      sess.step = 'confirm';
-      bot.sendMessage(chatId,
-        '🚀 *Confirm Growth Engine*\n\nCoin: *' + sess.data.coinName + '*\n~' + ethPerBuy + ' ETH every ~' + v + ' min × ' + sess.data.numBuys + ' buys\nTotal: ~*' + sess.data.totalEth + ' ETH*\n🎲 ±15% jitter on amount & timing',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
-          { text: '✅ Start', callback_data: 'growth_confirm' },
-          { text: '❌ Cancel', callback_data: 'growth_cancel' },
-        ]]}}
+  if (state.autoMode) {
+    const result = executeBuy(address, ethAmt, BUYER_WALLET);
+    if (result.success) {
+      const tx = result.data?.txHash || result.data?.transactionHash || 'pending';
+      const k = addrKey(address);
+      positions[address] = {
+        coinName, address, buyPriceUsd, avgBuyPrice: buyPriceUsd,
+        boughtAt: Date.now(), ethSpent: ethAmt, source: 'watcher',
+        tpHits: new Array(state.tpOrders.length).fill(false), customTpOrders: null, fullyExited: false,
+      };
+      savePositions(positions);
+      bot.sendMessage(ADMIN_ID,
+        '🛒 *Bought ' + coinName + '*\n' + ethAmt + ' ETH | ' + tpSummary + ' | SL:-' + state.stopLossPct + '%\nFrom @' + fromUser + ' in ' + (groupName || 'group') + '\nTx: `' + tx + '`',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [
+          [{ text: '📊 View Position', callback_data: 'pd_' + k }],
+          [{ text: '◀️ Home', callback_data: 'home' }],
+        ]}}
       );
-    }
-    return;
-  }
-
-  // ── DCA custom coin wizard ──
-  if (sess.type === 'dca_custom') {
-    if (sess.step === 'address') {
-      const addr = val.match(/0x[a-fA-F0-9]{40}/)?.[0];
-      if (!addr) { bot.sendMessage(chatId, '❌ Invalid address:'); return; }
-      sess.data.address = addr;
-      const coin = await fetchPrice(addr);
-      sess.data.name = coin?.name || addr.slice(0, 10) + '...';
-      sess.step = 'eth';
-      bot.sendMessage(chatId, '💎 *Add Custom DCA — ' + sess.data.name + '*\n\nETH per cycle (e.g. `0.002`):', { parse_mode: 'Markdown' });
-    } else if (sess.step === 'eth') {
-      const v = parseFloat(val);
-      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter a valid ETH amount:'); return; }
-      state.dca.customCoins = state.dca.customCoins || [];
-      state.dca.customCoins.push({ address: sess.data.address, name: sess.data.name, ethPerCycle: v });
-      saveState(state);
-      delete sessions[chatId];
-      addrKey(sess.data.address);
-      bot.sendMessage(chatId, '✅ Added *' + sess.data.name + '* to DCA\n' + v + ' ETH per cycle', { parse_mode: 'Markdown' });
-      sendDcaPanel(chatId);
-    }
-    return;
-  }
-
-  // ── TP wizard ──
-  if (sess.type === 'tp') {
-    const num = parseFloat(val);
-    if (isNaN(num) || num <= 0) { bot.sendMessage(chatId, '❌ Enter a valid number, or /cancel:'); return; }
-    if (sess.step === 'pct') {
-      sess.data.pct = num;
-      sess.step = 'sell';
-      bot.sendMessage(chatId, '🎯 Trigger at *+' + num + '%*\n\nNow enter sell % (1-100):', { parse_mode: 'Markdown' });
-    } else if (sess.step === 'sell') {
-      const sellPct = Math.min(100, Math.max(1, num));
-      const forAddr = sess.data.forCoin;
-      if (forAddr && positions[forAddr]) {
-        const pos = positions[forAddr];
-        if (!pos.customTpOrders) pos.customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
-        if (sess.data.editIndex === -1) {
-          pos.customTpOrders.push({ pct: sess.data.pct, sellPct });
-        } else {
-          pos.customTpOrders[sess.data.editIndex] = { pct: sess.data.pct, sellPct };
-        }
-        pos.customTpOrders.sort((a, b) => a.pct - b.pct);
-        pos.tpHits = new Array(pos.customTpOrders.length).fill(false);
-        savePositions(positions);
-        delete sessions[chatId];
-        bot.sendMessage(chatId, '✅ TP saved for *' + pos.coinName + '*: +' + sess.data.pct + '% → sell ' + sellPct + '%', { parse_mode: 'Markdown' });
-        sendCoinTpManager(chatId, forAddr);
-      } else {
-        if (sess.data.editIndex === -1) {
-          state.tpOrders.push({ pct: sess.data.pct, sellPct });
-        } else {
-          state.tpOrders[sess.data.editIndex] = { pct: sess.data.pct, sellPct };
-        }
-        state.tpOrders.sort((a, b) => a.pct - b.pct);
-        saveState(state);
-        delete sessions[chatId];
-        bot.sendMessage(chatId, '✅ Global TP: +' + sess.data.pct + '% → sell ' + sellPct + '%');
-        sendGlobalTpManager(chatId);
-      }
-    }
-    return;
-  }
-
-  // ── Manual sell / buy wizard ──
-  if (sess.type === 'manual_sell') {
-    const pct = Math.min(100, Math.max(1, Math.round(parseFloat(val))));
-    if (isNaN(pct)) { bot.sendMessage(chatId, '❌ Enter 1-100:'); return; }
-    const addr = sess.data.address;
-    const pos = positions[addr];
-    delete sessions[chatId];
-    const walletPath = pos.source === 'dca' ? DCA_WALLET : BUYER_WALLET;
-    const r = executeSell(addr, pct, walletPath);
-    if (r.success) {
-      if (pct === 100) pos.fullyExited = true;
-      savePositions(positions);
-      const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
-      bot.sendMessage(chatId, '✅ Sold *' + pct + '%* of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
-      sendCoinDetail(chatId, addr);
     } else {
-      bot.sendMessage(chatId, '❌ Sell failed: `' + r.error + '`', { parse_mode: 'Markdown' });
+      bot.sendMessage(ADMIN_ID, '❌ Buy failed: *' + coinName + '*\n`' + result.error + '`', { parse_mode: 'Markdown' });
     }
-    return;
-  }
-
-  if (sess.type === 'buy_more') {
-    const eth = parseFloat(val);
-    if (isNaN(eth) || eth <= 0) { bot.sendMessage(chatId, '❌ Enter a valid ETH amount:'); return; }
-    const addr = sess.data.address;
-    const pos = positions[addr];
-    delete sessions[chatId];
-    const walletPath = pos.source === 'dca' ? DCA_WALLET : BUYER_WALLET;
-    const r = executeBuy(addr, eth, walletPath);
-    if (r.success) {
-      pos.ethSpent = (pos.ethSpent || 0) + eth;
-      savePositions(positions);
-      const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
-      bot.sendMessage(chatId, '✅ Bought more *' + pos.coinName + '* (' + eth + ' ETH)\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
-      sendCoinDetail(chatId, addr);
-    } else {
-      bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' });
-    }
-    return;
+  } else {
+    const k = addrKey(address);
+    const pending_key = 'pnd_' + Date.now();
+    sessions[pending_key] = { address, coinName, buyPriceUsd, createdAt: Date.now() };
+    bot.sendMessage(ADMIN_ID,
+      '🔔 *' + coinName + '* spotted in ' + (groupName || 'group') + '\nBy @' + fromUser + '\nBuy for *' + ethAmt + ' ETH*?',
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
+        { text: '✅ Buy', callback_data: 'pby_' + pending_key },
+        { text: '❌ Skip', callback_data: 'psk_' + pending_key },
+      ]]}}
+    );
   }
 }
 
-// ── ETH Price (cached) ───────────────────────────────────────────────────
-let cachedEthPrice = 2400;
-let ethPriceFetchedAt = 0;
-async function getEthPrice() {
-  if (Date.now() - ethPriceFetchedAt < 5 * 60 * 1000) return cachedEthPrice; // cache 5 min
-  try {
-    const res = await dexFetch('https://api.dexscreener.com/latest/dex/tokens/0x4200000000000000000000000000000000000006');
-    const pair = (res?.pairs || []).find(p => p.chainId === 'base' && p.quoteToken?.symbol === 'USDC');
-    if (pair?.priceUsd) { cachedEthPrice = parseFloat(pair.priceUsd); ethPriceFetchedAt = Date.now(); }
-  } catch {}
-  return cachedEthPrice;
-}
-function usdToEth(usd) { return usd / cachedEthPrice; }
-function ethToUsd(eth) { return eth * cachedEthPrice; }
-
-// ── Token Scanner ────────────────────────────────────────────────────────────
-function dexFetch(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'ZoraBot/1.0' } }, res => {
-      let data = '';
-      res.on('data', c => data += c);
-      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-    }).on('error', reject);
-  });
-}
-
+// ── Token Scanner ─────────────────────────────────────────────────────────────
 async function scanToken(chatId, address) {
-  bot.sendMessage(chatId, '🔍 Scanning `' + address.slice(0, 10) + '...' + address.slice(-4) + '`...', { parse_mode: 'Markdown' });
+  address = address.toLowerCase();
+  bot.sendMessage(chatId, '🔍 Scanning `' + address.slice(0, 8) + '...' + address.slice(-4) + '`…', { parse_mode: 'Markdown' });
 
-  let dexData = null;
-  let zoraCoin = null;
-
-  // Fetch DexScreener (works for ALL Base tokens)
+  let dexData = null; let zoraCoin = null;
   try {
-    const res = await dexFetchRL('https://api.dexscreener.com/latest/dex/tokens/' + address);
+    const res = await dexRL('https://api.dexscreener.com/latest/dex/tokens/' + address);
     const pairs = (res?.pairs || []).filter(p => p.chainId === 'base');
-    if (pairs.length > 0) dexData = pairs[0]; // best pair
+    if (pairs.length > 0) {
+      dexData = pairs.reduce((best, p) => (!best || (p.liquidity?.usd || 0) > (best.liquidity?.usd || 0)) ? p : best, null);
+    }
   } catch (e) { log('[scan] DexScreener error: ' + e.message); }
 
-  // Try Zora SDK for extra Zora-specific data
-  try {
-    if (sdkGetCoin) {
-      const r = await sdkGetCoin({ address });
-      zoraCoin = r?.data?.zora20Token;
-    }
-  } catch {}
+  if (sdkGetCoin) {
+    try { const r = await sdkGetCoin({ address }); zoraCoin = r?.data?.zora20Token; } catch {}
+  }
 
   if (!dexData && !zoraCoin) {
-    bot.sendMessage(chatId, '❌ No data found for this address on Base.\n\nMake sure it\'s a valid Base chain token.');
+    bot.sendMessage(chatId, '❌ No data found on Base for this address.');
     return;
   }
 
-  const token = dexData?.baseToken || {};
-  const name   = zoraCoin?.name || token.name || 'Unknown';
-  const symbol = token.symbol || name;
-  const mcap   = dexData?.marketCap ? '$' + parseFloat(dexData.marketCap).toLocaleString(undefined, {maximumFractionDigits: 0}) : (zoraCoin?.marketCap ? '$' + parseFloat(zoraCoin.marketCap).toLocaleString(undefined, {maximumFractionDigits: 0}) : '?');
-  const price  = dexData?.priceUsd ? '$' + parseFloat(dexData.priceUsd).toFixed(8) : '?';
-  const liqUsd = dexData?.liquidity?.usd ? '$' + parseFloat(dexData.liquidity.usd).toLocaleString(undefined, {maximumFractionDigits: 0}) : '?';
-  const liqPct = dexData?.liquidity?.usd && dexData?.marketCap ? (parseFloat(dexData.liquidity.usd) / parseFloat(dexData.marketCap) * 100).toFixed(1) + '%' : '?';
-  const vol24  = dexData?.volume?.h24 ? '$' + parseFloat(dexData.volume.h24).toLocaleString(undefined, {maximumFractionDigits: 0}) : '?';
-  const chg1h  = dexData?.priceChange?.h1 != null ? (dexData.priceChange.h1 >= 0 ? '+' : '') + dexData.priceChange.h1 + '%' : '?';
-  const chg24  = dexData?.priceChange?.h24 != null ? (dexData.priceChange.h24 >= 0 ? '+' : '') + dexData.priceChange.h24 + '%' : '?';
-  const buys24 = dexData?.txns?.h24?.buys ?? '?';
+  const token   = dexData?.baseToken || {};
+  const name    = zoraCoin?.name || token.name || 'Unknown';
+  const symbol  = token.symbol || name;
+  const mcap    = dexData?.marketCap    ? '$' + num(dexData.marketCap) : (zoraCoin?.marketCap ? '$' + num(zoraCoin.marketCap) : '?');
+  const price   = dexData?.priceUsd     ? '$' + parseFloat(dexData.priceUsd).toFixed(8) : '?';
+  const liqUsd  = dexData?.liquidity?.usd ? '$' + num(dexData.liquidity.usd) : '?';
+  const liqPct  = (dexData?.liquidity?.usd && dexData?.marketCap)
+    ? (parseFloat(dexData.liquidity.usd) / parseFloat(dexData.marketCap) * 100).toFixed(1) + '%' : '?';
+  const vol24   = dexData?.volume?.h24  ? '$' + num(dexData.volume.h24) : '?';
+  const chg1h   = fmtChg(dexData?.priceChange?.h1);
+  const chg24   = fmtChg(dexData?.priceChange?.h24);
+  const buys24  = dexData?.txns?.h24?.buys ?? '?';
   const sells24 = dexData?.txns?.h24?.sells ?? '?';
-  const dex    = dexData?.dexId ? dexData.dexId.charAt(0).toUpperCase() + dexData.dexId.slice(1) : 'Unknown';
   const holders = zoraCoin?.uniqueHolders ? zoraCoin.uniqueHolders.toLocaleString() : '?';
   const created = dexData?.pairCreatedAt ? new Date(dexData.pairCreatedAt).toLocaleDateString() : '?';
+  const liqNum  = parseFloat(dexData?.liquidity?.usd || 0);
+  const liqWarn = liqNum < 1000 ? '\n🚨 *VERY LOW LIQUIDITY*' : liqNum < 5000 ? '\n⚠️ Low liquidity' : '';
 
-  // Detect factory/platform
-  const websites = dexData?.info?.websites || [];
+  // Detect factory
+  const sites  = (dexData?.info?.websites || []).map(w => w.url || '');
   const labels = dexData?.labels || [];
   let factory = '❓ Unknown';
-  if (websites.some(w => w.url?.includes('zora.co'))) factory = '🟣 Zora ✅';
-  else if (websites.some(w => w.url?.includes('virtuals.io'))) factory = '🤖 Virtuals';
-  else if (websites.some(w => w.url?.includes('clanker'))) factory = '🔧 Clanker';
-  else if (labels.includes('v2')) factory = '🦄 Uniswap V2';
-  else if (labels.includes('v3')) factory = '🦄 Uniswap V3';
+  if (sites.some(u => u.includes('zora.co'))) factory = '🟣 Zora ✅';
+  else if (sites.some(u => u.includes('virtuals.io'))) factory = '🤖 Virtuals';
+  else if (sites.some(u => u.includes('clanker'))) factory = '🔧 Clanker';
   else if (labels.includes('v4')) factory = '🦄 Uniswap V4';
+  else if (labels.includes('v3')) factory = '🦄 Uniswap V3';
+  else if (labels.includes('v2')) factory = '🦄 Uniswap V2';
 
-  // Liquidity safety signal
-  const liqNum = parseFloat(dexData?.liquidity?.usd || 0);
-  const liqWarning = liqNum < 1000 ? '\n🚨 *VERY LOW LIQUIDITY*' : liqNum < 5000 ? '\n⚠️ Low liquidity' : '';
+  const k = addrKey(address);
+  const inPos = !!positions[address];
+  const ethAmt = state.ethAmount;
 
-  const msg =
-    liqWarning + '\n\n' +
-    '*' + name.toUpperCase() + '* (' + symbol + ')' +
-    '\n`' + address + '`\n\n' +
-    '*Pool Info*\n' +
-    '🏭 Factory: ' + factory + '\n' +
-    '📊 Mcap: *' + mcap + '*\n' +
-    '💧 Liq: *' + liqUsd + '* | ' + liqPct + '\n' +
-    '💹 Price: ' + price + '\n\n' +
-    '*24h Stats*\n' +
-    '📈 Change: *' + chg24 + '*  |  1h: ' + chg1h + '\n' +
-    '📦 Vol: *' + vol24 + '*\n' +
-    '🔄 Txns: ' + buys24 + ' buys / ' + sells24 + ' sells\n' +
+  const msg = liqWarn + '\n\n*' + name.toUpperCase() + '* (' + symbol + ')\n`' + address + '`\n\n' +
+    '🏭 ' + factory + '\n' +
+    '📊 Mcap: *' + mcap + '*  24h: *' + chg24 + '*\n' +
+    '💧 Liq: *' + liqUsd + '* (' + liqPct + ')\n' +
+    '💹 Price: ' + price + '\n' +
+    '📦 Vol 24h: *' + vol24 + '*\n' +
+    '🔄 ' + buys24 + '🟢 / ' + sells24 + '🔴  |  1h: ' + chg1h + '\n' +
     '👥 Holders: ' + holders + '\n' +
     '📅 Created: ' + created;
-
-  addrKey(address);
-  const k = addrKey(address);
-  const inPosition = !!positions[address];
 
   bot.sendMessage(chatId, msg, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [
-      [{ text: '🟢 BUY 0.005 ETH', callback_data: 'scanbuy_005_' + k }, { text: '🟢 BUY X ETH', callback_data: 'scanbuy_x_' + k }],
-      [{ text: '🚀 Growth Engine', callback_data: 'scangrowth_' + k }, { text: '📊 DCA This Coin', callback_data: 'scandca_' + k }],
-      inPosition ? [{ text: '📋 View Position', callback_data: 'pd_' + k }] : [],
-      [{ text: '🔄 Refresh Scan', callback_data: 'scan_' + k }],
+      [{ text: '🟢 Buy ' + ethAmt + ' ETH', callback_data: 'scanbuy_x_' + k }],
+      [{ text: '📈 DCA This Coin', callback_data: 'scandca_' + k }, { text: '🔄 Refresh', callback_data: 'scan_' + k }],
+      inPos ? [{ text: '📋 View Position', callback_data: 'pd_' + k }] : [],
+      [{ text: '◀️ Home', callback_data: 'home' }],
     ].filter(r => r.length > 0)}
   });
 }
 
+// ── Formatting helpers ────────────────────────────────────────────────────────
+function num(n) { return parseFloat(n).toLocaleString(undefined, { maximumFractionDigits: 0 }); }
+function fmtChg(v) { if (v == null) return '?'; return (v >= 0 ? '+' : '') + v + '%'; }
+function fmtEth(n) { return parseFloat(n).toFixed(5); }
 
-// ── TP Button Pickers ─────────────────────────────────────────────────────────
-function sendTpTriggerPicker(chatId, context, current) {
-  // context: encoded string passed through to the set callback
-  const presets = [5,10,15,20,25,30,40,50,75,100,150,200];
-  const rows = [];
-  for (let i = 0; i < presets.length; i += 4) {
-    rows.push(presets.slice(i, i+4).map(p => ({
-      text: (p === current ? '✅ ' : '') + '+' + p + '%',
-      callback_data: 'tpset_pct_' + p + '_' + context
-    })));
-  }
-  bot.sendMessage(chatId, '🎯 *Set Trigger %* (current: +' + current + '%)', {
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: rows }
-  });
-}
-
-function sendTpSellPicker(chatId, context, current) {
-  // After trigger is set, pick sell %
-  const presets = [10,20,25,33,50,67,75,100];
-  bot.sendMessage(chatId, '💰 *Set Sell %* (current: ' + current + '%) — how much to sell when triggered', {
-    parse_mode: 'Markdown',
-    reply_markup: { inline_keyboard: [
-      presets.slice(0,4).map(p => ({ text: (p === current ? '✅ ' : '') + p + '%', callback_data: 'tpset_sell_' + p + '_' + context })),
-      presets.slice(4).map(p => ({ text: (p === current ? '✅ ' : '') + p + '%', callback_data: 'tpset_sell_' + p + '_' + context })),
-    ]}
-  });
-}
-
-// ── Main menu ─────────────────────────────────────────────────────────────────
-function sendMainMenu(chatId) {
-  const watchStatus = state.watcherEnabled ? '🟢' : '🔴';
-  const dcaStatus   = state.dca.enabled   ? '🟢' : '🔴';
-  const openPos     = Object.keys(positions).filter(a => !positions[a].fullyExited).length;
-  const engines     = Object.keys(activeEngines).length;
+// ── Main Menu ─────────────────────────────────────────────────────────────────
+async function sendMainMenu(chatId) {
+  const openPos = Object.keys(positions).filter(a => !positions[a].fullyExited).length;
+  const wIcon = state.watcherEnabled ? '🟢' : '🔴';
+  const activeBaskets = (state.dca.baskets || []).filter(b => b.enabled).length;
+  const dcaIcon = activeBaskets > 0 ? '🟢' : '🔴';
+  const botName = state.botName || 'SelectaBot';
 
   bot.sendMessage(chatId,
-    '*🐸 Zora Bot*\n\n' +
-    watchStatus + ' Group Watcher  |  ' + (state.autoMode ? '⚡ Auto' : '👋 Manual') + '\n' +
-    dcaStatus + ' DCA Engine  |  Next: ' + (state.dca.nextDcaAt ? new Date(state.dca.nextDcaAt).toUTCString().slice(0,22) : 'not set') + '\n' +
-    '📊 ' + openPos + ' open position(s)\n' +
-    (engines > 0 ? '🚀 ' + engines + ' growth engine(s) running\n' : ''),
+    '*🎵 ' + botName + '*\n\n' +
+    '*👂 Listener*\nAdd the bot to a group chat and auto-buy every coin discussed\n\n' +
+    '*📈 DCA*\nSet up buys for coins, or groups of coins, on regular intervals\n\n' +
+    wIcon + ' Listener  ' + dcaIcon + ' DCA  📊 ' + openPos + ' open positions',
     {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: [
-        [{ text: watchStatus + ' Group Watcher', callback_data: 'watcher_panel' }, { text: dcaStatus + ' DCA Engine', callback_data: 'dca_panel' }],
-        [{ text: '🚀 Growth Engine', callback_data: 'growth_panel' }, { text: '📊 Positions', callback_data: 'positions' }],
-        [{ text: '💰 Balance', callback_data: 'balance' }, { text: '🔄 Refresh', callback_data: 'main_menu' }],
+        [{ text: '👂 Listener', callback_data: 'listener' }, { text: '📈 DCA', callback_data: 'dcap' }],
+        [{ text: '💰 Wallets', callback_data: 'wallets' }, { text: '📊 Positions', callback_data: 'posp' }],
+        [{ text: '📲 Download Zora', url: 'https://zora.co/download' }, { text: '⚙️ Settings', callback_data: 'setp' }],
       ]}
     }
   );
 }
 
-// ── Watcher panel ─────────────────────────────────────────────────────────────
-function sendWatcherPanel(chatId) {
-  const tpList = state.tpOrders.map((t, i) => 'TP' + (i+1) + ': +' + t.pct + '% sell ' + t.sellPct + '%').join('\n  ');
+// ── Listener Panel ────────────────────────────────────────────────────────────
+async function sendListenerPanel(chatId) {
+  const amtLine = await buyAmountLine();
+  const tpList = state.tpOrders.map((t, i) => 'TP' + (i+1) + ': +' + t.pct + '% → sell ' + t.sellPct + '%').join('\n');
+
   bot.sendMessage(chatId,
-    '*👁 Group Watcher*\n\n' +
-    'Status: ' + (state.watcherEnabled ? '🟢 ON' : '🔴 OFF') + '  Mode: ' + (state.autoMode ? '⚡ Auto' : '👋 Manual') + '\n' +
-    'Buy: *' + state.ethAmount + ' ETH*  |  SL: *-' + state.stopLossPct + '%*\n\n' +
-    '*Global TPs:*\n  ' + tpList,
+    '*👂 Listener*\n\n' +
+    'Status: ' + (state.watcherEnabled ? '🟢 ON' : '🔴 OFF') + '\n' +
+    'Mode: ' + (state.autoMode ? '⚡ Auto-buy' : '👋 Manual confirm') + '\n' +
+    'Buy: *' + amtLine + '*\n' +
+    'Stop-loss: *-' + state.stopLossPct + '%*\n\n' +
+    '*Take-Profit Orders:*\n' + tpList,
     {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: [
-        [{ text: state.watcherEnabled ? '🔴 Turn OFF' : '🟢 Turn ON', callback_data: 'w_toggle' }, { text: state.autoMode ? '👋 Manual' : '⚡ Auto', callback_data: 'w_mode' }],
+        [
+          { text: state.watcherEnabled ? '🔴 Turn OFF' : '🟢 Turn ON', callback_data: 'w_toggle' },
+          { text: state.autoMode ? '👋 Switch to Manual' : '⚡ Switch to Auto', callback_data: 'w_mode' },
+        ],
         [{ text: '💰 Buy Amount', callback_data: 'w_amount' }, { text: '📉 Stop-Loss', callback_data: 'w_sl' }],
-        [{ text: '📈 TP Orders', callback_data: 'tp_global' }, { text: state.watcherPriceCheckEnabled ? '🙈 Pause Watcher' : '👁 Resume Watcher', callback_data: 'w_price_toggle' }],
-        [{ text: '◀️ Main Menu', callback_data: 'main_menu' }],
+        [{ text: '📈 TP Orders', callback_data: 'tp_global' }],
+        [{ text: '◀️ Home', callback_data: 'home' }],
       ]}
     }
   );
 }
 
-// ── DCA panel ─────────────────────────────────────────────────────────────────
+// ── DCA Panel (basket list) ────────────────────────────────────────────────────
 function sendDcaPanel(chatId) {
-  const d = state.dca;
-  const customList = (d.customCoins || []).map((c, i) => '  • ' + c.name + ' (' + c.ethPerCycle + ' ETH) 🗑').join('\n') || '  None';
-  const nextStr = d.nextDcaAt ? new Date(d.nextDcaAt).toUTCString().slice(0, 25) : 'Not set';
+  const baskets = state.dca.baskets || [];
+  const keyboard = [[{ text: '➕ New Basket', callback_data: 'b_new' }]];
 
-  const keyboard = [
-    [{ text: d.enabled ? '⏸ Pause DCA' : '▶️ Start DCA', callback_data: 'dca_toggle' }, { text: '⚡ Run Now', callback_data: 'dca_runnow' }],
-    [{ text: '⏱ Interval (' + d.intervalHours + 'h)', callback_data: 'dca_interval' }, { text: '💎 ETH/coin (' + d.ethPerCoin + ')', callback_data: 'dca_eth' }],
-    [{ text: '📊 Min Mcap', callback_data: 'dca_mcap' }, { text: '👥 Min Holders', callback_data: 'dca_holders' }],
-    [{ text: '➕ Add Custom Coin', callback_data: 'dca_add_custom' }],
-  ];
-
-  // Add remove buttons for custom coins
-  (d.customCoins || []).forEach((c, i) => {
-    addrKey(c.address);
-    keyboard.push([{ text: '🗑 ' + c.name, callback_data: 'dca_rm_' + i }]);
-  });
-
-  keyboard.push([{ text: '◀️ Main Menu', callback_data: 'main_menu' }]);
+  for (const b of baskets) {
+    const icon = b.enabled ? '🟢' : '⏸';
+    const next = b.nextRunAt ? '  Next: ' + new Date(b.nextRunAt).toUTCString().slice(5, 17) : '';
+    keyboard.push([{ text: icon + ' ' + b.name + next, callback_data: 'b_det_' + shortId(b.id) }]);
+  }
+  keyboard.push([{ text: '◀️ Home', callback_data: 'home' }]);
 
   bot.sendMessage(chatId,
     '*📈 DCA Engine*\n\n' +
-    'Status: ' + (d.enabled ? '🟢 Running' : '🔴 Paused') + '\n' +
-    'Interval: *' + d.intervalHours + 'h*  |  ETH/coin: *' + d.ethPerCoin + '*\n' +
-    'Max coins: *' + d.maxCoins + '*  |  Min mcap: *$' + (d.minMcap/1000).toFixed(0) + 'k*\n' +
-    'Next DCA: ' + nextStr + '\n\n' +
-    '*Custom DCA Coins:*\n' + customList,
+    (baskets.length ? baskets.length + ' basket(s) configured' : 'No baskets yet. Create one to start DCA.'),
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
   );
 }
 
-// ── Growth engine panel ───────────────────────────────────────────────────────
-function sendGrowthPanel(chatId) {
-  const engines = Object.entries(activeEngines);
-  const keyboard = [[{ text: '🚀 New Growth Engine', callback_data: 'growth_new' }]];
+// ── Basket Detail ─────────────────────────────────────────────────────────────
+function sendBasketDetail(chatId, basket) {
+  const sid = shortId(basket.id);
+  const nextStr = basket.nextRunAt ? new Date(basket.nextRunAt).toUTCString().slice(0, 25) : 'Not scheduled';
+  const modeStr = basket.mode === 'leaderboard'
+    ? 'Leaderboard (' + basket.lbSort + ', ' + basket.maxCoins + ' coins)'
+    : 'Custom coins (' + (basket.coins || []).length + ')';
 
-  engines.forEach(([id, eng]) => {
+  bot.sendMessage(chatId,
+    '*' + (basket.enabled ? '🟢' : '⏸') + ' ' + basket.name + '*\n\n' +
+    '📅 Every *' + (basket.intervalMinutes >= 1440 ? (basket.intervalMinutes/1440).toFixed(1) + 'd' : basket.intervalMinutes >= 60 ? (basket.intervalMinutes/60).toFixed(1) + 'h' : basket.intervalMinutes + 'min') + '*' +
+    '  |  💎 *' + basket.ethPerCoin + ' ETH/coin*\n' +
+    '🔄 Runs: ' + basket.runsCompleted + (basket.maxRuns ? '/' + basket.maxRuns : '') + '\n' +
+    '💸 Spent: ' + fmtEth(basket.totalSpent) + (basket.totalBudget ? '/' + basket.totalBudget : '') + ' ETH\n' +
+    '🎯 Mode: ' + modeStr + '\n' +
+    '🛡 SL: -' + basket.slPct + '%\n' +
+    '⏰ Next: ' + nextStr,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [
+          { text: basket.enabled ? '⏸ Pause' : '▶️ Enable', callback_data: 'b_en_' + sid },
+          { text: '⚡ Run Now', callback_data: 'b_run_' + sid },
+        ],
+        [{ text: '⚙️ Settings', callback_data: 'b_set_' + sid }, { text: '🪙 Coins', callback_data: 'b_coins_' + sid }],
+        [{ text: '🔍 Preview', callback_data: 'b_pre_' + sid }, { text: '🗑 Delete', callback_data: 'b_del_' + sid }],
+        [{ text: '◀️ DCA', callback_data: 'dcap' }],
+      ]}
+    }
+  );
+}
+
+// ── Basket Settings ───────────────────────────────────────────────────────────
+async function sendBasketSettings(chatId, basket) {
+  const sid = shortId(basket.id);
+  const ethPrice = await getEthPrice();
+  const usdPerCoin = (basket.ethPerCoin * ethPrice).toFixed(2);
+
+  bot.sendMessage(chatId,
+    '*⚙️ ' + basket.name + ' Settings*\n\n' +
+    '💎 ETH/coin: *' + basket.ethPerCoin + ' ETH* (~$' + usdPerCoin + ')\n' +
+    '⏱ Interval: *' + basket.intervalMinutes + ' min*\n' +
+    '🔢 Max runs: *' + (basket.maxRuns || 'unlimited') + '*\n' +
+    '💰 Budget: *' + (basket.totalBudget || 'unlimited') + ' ETH*\n' +
+    '🛡 SL: *-' + basket.slPct + '%*\n' +
+    '📊 Mode: *' + basket.mode + '*\n' +
+    '📈 Sort by: *' + basket.lbSort + '*\n' +
+    '🏦 Min mcap: *$' + num(basket.minMcap) + '*\n' +
+    '👥 Min holders: *' + basket.minHolders + '*\n' +
+    '🔢 Max coins: *' + basket.maxCoins + '*',
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [{ text: '💎 ETH/coin', callback_data: 'bs_eth_' + sid }, { text: '⏱ Interval', callback_data: 'bs_int_' + sid }],
+        [{ text: '🔢 Max Runs', callback_data: 'bs_maxr_' + sid }, { text: '💰 Budget', callback_data: 'bs_bud_' + sid }],
+        [{ text: '🛡 Stop-Loss', callback_data: 'bs_sl_' + sid }, { text: '📈 TP Orders', callback_data: 'bs_tp_' + sid }],
+        [{ text: '📊 Mode: ' + basket.mode, callback_data: 'bs_mode_' + sid }],
+        [{ text: '📈 Sort: ' + basket.lbSort, callback_data: 'bs_sort_' + sid }, { text: '🏦 Min Mcap', callback_data: 'bs_mcap_' + sid }],
+        [{ text: '👥 Min Holders', callback_data: 'bs_hld_' + sid }, { text: '🔢 Max Coins', callback_data: 'bs_mc_' + sid }],
+        [{ text: '✏️ Rename', callback_data: 'bs_name_' + sid }, { text: '◀️ Back', callback_data: 'b_det_' + sid }],
+      ]}
+    }
+  );
+}
+
+// ── Basket Coins List ─────────────────────────────────────────────────────────
+function sendBasketCoins(chatId, basket) {
+  const sid = shortId(basket.id);
+  const coins = basket.coins || [];
+  const keyboard = [[{ text: '➕ Add Coin', callback_data: 'bc_add_' + sid }]];
+  coins.forEach((c, i) => {
     keyboard.push([
-      { text: '⚡ ' + eng.coinName + ' (' + eng.done + '/' + eng.total + ')', callback_data: 'growth_status' },
-      { text: '🛑 Cancel', callback_data: 'growth_stop_' + id.slice(0, 20) },
+      { text: '🪙 ' + c.name, callback_data: 'noop' },
+      { text: '🗑', callback_data: 'bc_rm_' + sid + '_' + i },
     ]);
   });
-
-  keyboard.push([{ text: '◀️ Main Menu', callback_data: 'main_menu' }]);
+  keyboard.push([{ text: '◀️ Back', callback_data: 'b_det_' + sid }]);
 
   bot.sendMessage(chatId,
-    '*🚀 Growth Engine*\n\n' +
-    (engines.length ? engines.map(([_, e]) => '⚡ *' + e.coinName + '* — ' + e.done + '/' + e.total + ' buys done').join('\n') : 'No active engines.') + '\n\n' +
-    'Start a new TWAP-style buy sequence:',
+    '*🪙 ' + basket.name + ' — Coins*\n' +
+    (coins.length ? coins.map(c => '• ' + c.name + '\n  `' + c.address + '`').join('\n') : 'No coins added.') +
+    '\n\n_(Used in "coins" mode only)_',
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
   );
 }
 
-// ── Positions list ────────────────────────────────────────────────────────────
-async function sendPositionsList(chatId) {
-  const allAddrs = Object.keys(positions);
-  if (!allAddrs.length) { bot.sendMessage(chatId, '📊 No positions yet.'); return; }
+// ── Wallets Panel ─────────────────────────────────────────────────────────────
+async function sendWalletsPanel(chatId) {
+  const ethPrice = await getEthPrice();
+  const buyerBal = getBalance(BUYER_WALLET);
+  const dcaBal   = getBalance(DCA_WALLET);
+  const bEth  = parseFloat(buyerBal?.wallet?.[0]?.balance || '0');
+  const dEth  = parseFloat(dcaBal?.wallet?.[0]?.balance   || '0');
+  const bUsd  = (bEth * ethPrice).toFixed(2);
+  const dUsd  = (dEth * ethPrice).toFixed(2);
+  const total = ((bEth + dEth) * ethPrice).toFixed(2);
+  const bAddr = getWalletAddress(BUYER_WALLET) || '(unknown)';
+  const dAddr = getWalletAddress(DCA_WALLET)   || '(unknown)';
 
-  // Show open positions by default; exited ones shown at bottom greyed out
-  const openAddrs = allAddrs.filter(a => !positions[a].fullyExited);
-  const exitedAddrs = allAddrs.filter(a => positions[a].fullyExited);
-  const addrs = [...openAddrs, ...exitedAddrs];
+  // Holdings from positions
+  const openPos = Object.keys(positions).filter(a => !positions[a].fullyExited);
+  const holdStr = openPos.length ? openPos.length + ' active position(s)' : 'No open positions';
 
-  const priceMap = await fetchPriceBulk(openAddrs); // only fetch live prices for open
-  const keyboard = [];
-
-  for (const addr of addrs) {
-    addrKey(addr);
-    const p = positions[addr];
-    const coin = priceMap[addr];
-    const status = p.fullyExited ? '⚪' : (coin?.priceUsd && p.buyPriceUsd && ((coin.priceUsd - (p.avgBuyPrice || p.buyPriceUsd)) / (p.avgBuyPrice || p.buyPriceUsd)) >= 0 ? '🟢' : '🔴');
-    let label = status + ' ' + p.coinName;
-    if (coin?.priceUsd && (p.avgBuyPrice || p.buyPriceUsd)) {
-      const ref = p.avgBuyPrice || p.buyPriceUsd;
-      const chg = ((coin.priceUsd - ref) / ref * 100);
-      label += '  ' + (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%';
+  bot.sendMessage(chatId,
+    '*💰 Wallets*\n\nTotal: ~*$' + total + '*\n\n' +
+    '🔵 *Listening Wallet*\n`' + bAddr.slice(0,8) + '...' + bAddr.slice(-4) + '`\n' + fmtEth(bEth) + ' ETH  (~$' + bUsd + ')\n\n' +
+    '🟣 *DCA Wallet*\n`' + dAddr.slice(0,8) + '...' + dAddr.slice(-4) + '`\n' + fmtEth(dEth) + ' ETH  (~$' + dUsd + ')\n\n' +
+    '📊 Holdings: ' + holdStr,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [{ text: '🔵 Listening Wallet', callback_data: 'w_det_0' }, { text: '🟣 DCA Wallet', callback_data: 'w_det_1' }],
+        [{ text: '◀️ Home', callback_data: 'home' }],
+      ]}
     }
-    keyboard.push([{ text: label, callback_data: 'pd_' + addrKey(addr) }]);
+  );
+}
+
+// ── Wallet Detail ─────────────────────────────────────────────────────────────
+async function sendWalletDetail(chatId, walletIdx) {
+  const ethPrice = await getEthPrice();
+  const walletPath = walletIdx === 0 ? BUYER_WALLET : DCA_WALLET;
+  const label = walletIdx === 0 ? '🔵 Listening Wallet' : '🟣 DCA Wallet';
+  const otherLabel = walletIdx === 0 ? 'DCA' : 'Listening';
+  const bal = getBalance(walletPath);
+  const eth = parseFloat(bal?.wallet?.[0]?.balance || '0');
+  const usd = (eth * ethPrice).toFixed(2);
+  const addr = getWalletAddress(walletPath) || '(unknown)';
+
+  bot.sendMessage(chatId,
+    '*' + label + '*\n\n' +
+    '`' + addr + '`\n\n' +
+    'Balance: *' + fmtEth(eth) + ' ETH*  (~$' + usd + ')',
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [
+          { text: '↔️ Transfer to ' + otherLabel, callback_data: 'wtr_' + walletIdx },
+          { text: '💸 Cash Out', callback_data: 'wco_' + walletIdx },
+        ],
+        [{ text: '◀️ Wallets', callback_data: 'wallets' }],
+      ]}
+    }
+  );
+}
+
+// ── Positions Panel ───────────────────────────────────────────────────────────
+async function sendPositionsPanel(chatId) {
+  const allAddrs = Object.keys(positions);
+  if (!allAddrs.length) {
+    bot.sendMessage(chatId, '📊 No positions yet.', {
+      reply_markup: { inline_keyboard: [[{ text: '◀️ Home', callback_data: 'home' }]] }
+    });
+    return;
   }
 
-  keyboard.push([{ text: '🔄 Refresh', callback_data: 'positions' }, { text: '◀️ Main Menu', callback_data: 'main_menu' }]);
+  const openAddrs = allAddrs.filter(a => !positions[a].fullyExited);
+  const exitedAddrs = allAddrs.filter(a => positions[a].fullyExited);
+
+  // Fetch prices for open positions
+  const priceMap = {};
+  for (const addr of openAddrs) {
+    try { priceMap[addr] = await fetchPrice(addr); } catch {}
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  const ethPrice = await getEthPrice();
+
+  // Group by source
+  const groups = {}; // groupKey -> [addr, ...]
+  for (const addr of [...openAddrs, ...exitedAddrs]) {
+    const src = positions[addr].source || 'watcher';
+    const key = (src === 'watcher' || src === 'growth') ? '__watcher__' : src;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(addr);
+  }
+
+  const keyboard = [];
+
+  // Watcher section
+  if (groups['__watcher__']) {
+    keyboard.push([{ text: '👂 Watcher buys', callback_data: 'noop' }]);
+    for (const addr of groups['__watcher__']) {
+      keyboard.push([buildPositionRow(addr, priceMap[addr])]);
+    }
+  }
+
+  // Basket sections
+  for (const bid of Object.keys(groups).filter(k => k !== '__watcher__')) {
+    const basket = (state.dca.baskets || []).find(b => b.id === bid);
+    const bName = basket ? basket.name : bid;
+    const sid = basket ? shortId(basket.id) : bid.slice(0, 8);
+    keyboard.push([{ text: '📈 ' + bName, callback_data: 'b_det_' + sid }]);
+    for (const addr of groups[bid]) {
+      keyboard.push([buildPositionRow(addr, priceMap[addr])]);
+    }
+  }
+
+  keyboard.push([{ text: '🔄 Refresh', callback_data: 'posp' }, { text: '◀️ Home', callback_data: 'home' }]);
 
   bot.sendMessage(chatId,
-    '*📊 Positions (' + addrs.filter(a => !positions[a].fullyExited).length + ' open)*\nTap to manage.',
+    '*📊 Positions*  (' + openAddrs.length + ' open, ' + exitedAddrs.length + ' closed)',
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
   );
 }
 
-// ── Coin detail ───────────────────────────────────────────────────────────────
+function buildPositionRow(addr, coin) {
+  const pos = positions[addr];
+  const ref = pos.avgBuyPrice || pos.buyPriceUsd;
+  const exited = pos.fullyExited;
+  let label = (exited ? '⚪' : '❓') + ' ' + (pos.coinName || addr.slice(0, 8));
+  if (coin?.priceUsd && ref) {
+    const chg = ((coin.priceUsd - ref) / ref * 100);
+    label = (exited ? '⚪' : chg >= 0 ? '🟢' : '🔴') + ' ' + pos.coinName + '  ' + (chg >= 0 ? '+' : '') + chg.toFixed(1) + '%';
+  }
+  return { text: label, callback_data: 'pd_' + addrKey(addr) };
+}
+
+// ── Coin Detail ───────────────────────────────────────────────────────────────
 async function sendCoinDetail(chatId, address) {
+  address = address.toLowerCase();
   const pos = positions[address];
   if (!pos) { bot.sendMessage(chatId, '❌ Position not found.'); return; }
   addrKey(address);
+  const k = addrKey(address);
 
-  // Fetch price + DexScreener data in parallel
   const [coin, dexRes] = await Promise.all([
-    fetchPrice(address),
-    dexFetchRL('https://api.dexscreener.com/latest/dex/tokens/' + address).catch(() => null),
+    fetchPrice(address).catch(() => null),
+    dexRL('https://api.dexscreener.com/latest/dex/tokens/' + address).catch(() => null),
   ]);
-  const dex = (dexRes?.pairs || []).find(p => p.chainId === 'base');
+  const dex = (dexRes?.pairs || []).filter(p => p.chainId === 'base')
+    .reduce((best, p) => (!best || (p.liquidity?.usd || 0) > (best.liquidity?.usd || 0)) ? p : best, null);
 
   const ref = pos.avgBuyPrice || pos.buyPriceUsd;
   const activeTps = getEffectiveTps(pos);
   ensureTpHits(pos);
-  const tpStr = pos.tpHits.map((h, i) => (h ? '✅' : '⬜') + 'TP' + (i+1)).join(' ');
-  const openOrders = activeTps.filter((_, i) => !pos.tpHits[i]).length;
+  const ethSpent = parseFloat(pos.ethSpent || 0);
   const status = pos.fullyExited ? '⚪ EXITED' : '🟢 OPEN';
-  const slPct = pos.source === 'dca' ? state.dca.slPct : state.stopLossPct;
-  const k = addrKey(address);
-  const ethSpent = parseFloat(pos.ethSpent || pos.totalEthSpent || 0);
+  const openOrders = activeTps.filter((_, i) => !pos.tpHits[i]).length;
+  const srcBasket = pos.source?.startsWith('b_') ? (state.dca.baskets || []).find(b => b.id === pos.source) : null;
+  const slPct = srcBasket ? srcBasket.slPct : state.stopLossPct;
 
-  // Estimate ETH price from dex data (priceUsd / priceNative)
-  let ETH_PRICE = 2400;
+  // ETH price estimate
+  let ethPrice = await getEthPrice();
   if (dex?.priceUsd && dex?.priceNative && parseFloat(dex.priceNative) > 0) {
-    ETH_PRICE = parseFloat(dex.priceUsd) / parseFloat(dex.priceNative);
+    ethPrice = parseFloat(dex.priceUsd) / parseFloat(dex.priceNative);
   }
 
-  // ─ P&L calculation ─
-  // If no entry price recorded, use current price as basis (shows 0% — better than ?).
-  // This happens for growth engine positions created before the price-tracking fix.
-  const effectiveRef = ref || coin?.priceUsd || null;
-  if (!ref && coin?.priceUsd && pos.source === 'growth') {
-    // Backfill entry price for future calculations
-    pos.buyPriceUsd = coin.priceUsd;
-    pos.avgBuyPrice = coin.priceUsd;
-    savePositions(positions);
-  }
-
+  // P&L
   let pnlLine = '';
-  if (coin?.priceUsd && effectiveRef && ethSpent > 0) {
-    const ref = effectiveRef; // shadow outer ref
+  if (coin?.priceUsd && ref && ethSpent > 0) {
     const chgPct = ((coin.priceUsd - ref) / ref * 100);
-    const currentValueEth = ethSpent * (coin.priceUsd / ref);
-    const pnlEth = currentValueEth - ethSpent;
-    const pnlUsd = pnlEth * ETH_PRICE;
+    const curValEth = ethSpent * (coin.priceUsd / ref);
+    const pnlEth = curValEth - ethSpent;
+    const pnlUsd = pnlEth * ethPrice;
     const sign = chgPct >= 0 ? '+' : '';
-    const emoji = chgPct >= 0 ? '🟢' : '🔴';
-    pnlLine = emoji + ' *' + sign + chgPct.toFixed(2) + '%*' +
-      '  ' + sign + pnlEth.toFixed(5) + ' ETH' +
-      '  (~' + sign + '$' + pnlUsd.toFixed(2) + ')';
+    const em = chgPct >= 0 ? '🟢' : '🔴';
+    pnlLine = em + ' *' + sign + chgPct.toFixed(2) + '%*  ' + sign + fmtEth(pnlEth) + ' ETH  (~' + sign + '$' + pnlUsd.toFixed(2) + ')\n';
   }
 
-  // ─ Market data (minimal) ─
-  const mcap   = dex?.marketCap ? '$' + parseFloat(dex.marketCap).toLocaleString(undefined, {maximumFractionDigits:0}) : '?';
-  const liq    = dex?.liquidity?.usd ? '$' + parseFloat(dex.liquidity.usd).toLocaleString(undefined, {maximumFractionDigits:0}) : '?';
-  const vol24  = dex?.volume?.h24 ? '$' + parseFloat(dex.volume.h24).toLocaleString(undefined, {maximumFractionDigits:0}) : '?';
-  const chg24  = dex?.priceChange?.h24 != null ? (dex.priceChange.h24 >= 0 ? '+' : '') + dex.priceChange.h24 + '%' : '?';
+  const mcap   = dex?.marketCap    ? '$' + num(dex.marketCap) + (dex.priceChange?.h24 != null ? '  *' + fmtChg(dex.priceChange.h24) + '*' : '') : '?';
+  const liq    = dex?.liquidity?.usd ? '$' + num(dex.liquidity.usd) : '?';
+  const vol24  = dex?.volume?.h24   ? '$' + num(dex.volume.h24) : '?';
   const buys   = dex?.txns?.h24?.buys ?? '?';
   const sells  = dex?.txns?.h24?.sells ?? '?';
-  // Mcap 24h change from dex (more meaningful than token price)
-  const mcapChg24 = dex?.priceChange?.h24 != null ? (dex.priceChange.h24 >= 0 ? '+' : '') + dex.priceChange.h24 + '%' : null;
-  const mcapChg1h = dex?.priceChange?.h1 != null ? (dex.priceChange.h1 >= 0 ? '+' : '') + dex.priceChange.h1 + '%' : null;
-  const mcapStr = dex?.marketCap
-    ? '$' + parseFloat(dex.marketCap).toLocaleString(undefined, {maximumFractionDigits:0})
-      + (mcapChg24 ? '  *' + mcapChg24 + '*' : '')
-      + (mcapChg1h ? '  1h: ' + mcapChg1h : '')
-    : mcap;
-
-  // TP status with levels
   const tpDetail = activeTps.map((t, i) => (pos.tpHits[i] ? '✅' : '⬜') + '+' + t.pct + '%').join('  ');
-  const pnlPct = effectiveRef && coin?.priceUsd ? ((coin.priceUsd - effectiveRef) / effectiveRef * 100) : 0;
-  const showPnl = pnlLine && Math.abs(pnlPct) > 0.01;
+  const srcLabel = srcBasket ? '📈 ' + srcBasket.name : '👂 Watcher';
 
   const msg =
-    '*' + pos.coinName.toUpperCase() + '*  ' + status + '\n' +
-    (showPnl ? pnlLine + '\n' : '') +
-    'In: *' + ethSpent.toFixed(5) + ' ETH*\n\n' +
-    'Mcap: ' + mcapStr + '\n' +
-    'Liq: ' + liq + '  |  Vol: ' + vol24 + '\n' +
+    '*' + (pos.coinName || address.slice(0,10)).toUpperCase() + '*  ' + status + '  [' + srcLabel + ']\n\n' +
+    pnlLine +
+    'Cost: *' + fmtEth(ethSpent) + ' ETH*\n\n' +
+    'Mcap: ' + mcap + '\n' +
+    'Liq: ' + liq + '  Vol: ' + vol24 + '\n' +
     buys + '🟢 ' + sells + '🔴 (24h)\n\n' +
-    'TPs: ' + tpDetail + '  |  SL: -' + slPct + '%';
+    'TPs: ' + tpDetail + '  SL: -' + slPct + '%';
 
   bot.sendMessage(chatId, msg, {
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: [
       [{ text: '🟢 +0.001', callback_data: 'pb_001_' + k }, { text: '🟢 +0.005', callback_data: 'pb_005_' + k }, { text: '🟢 +X ETH', callback_data: 'pb_x_' + k }],
       [{ text: '🔴 25%', callback_data: 'ps_25_' + k }, { text: '🔴 50%', callback_data: 'ps_50_' + k }, { text: '🔴 100%', callback_data: 'ps_100_' + k }, { text: '🔴 X%', callback_data: 'ps_x_' + k }],
-      [{ text: '🔴 Initials', callback_data: 'ps_init_' + k }, { text: '🔔 TPs (' + openOrders + ')', callback_data: 'ptpm_' + k }],
-      [{ text: '🚀 Growth Engine', callback_data: 'pgrowth_' + k }, { text: '🔄 Refresh', callback_data: 'pd_' + k }],
-      [{ text: '◀️ Positions', callback_data: 'positions' }],
+      [{ text: '💸 Sell to Breakeven', callback_data: 'ps_bkv_' + k }],
+      [{ text: '🔔 TPs (' + openOrders + ' active)', callback_data: 'ptpm_' + k }, { text: '🔄 Refresh', callback_data: 'pd_' + k }],
+      [{ text: '◀️ Positions', callback_data: 'posp' }],
     ]}
   });
 }
 
-// ── Coin TP manager ───────────────────────────────────────────────────────────
-function sendCoinTpManager(chatId, address) {
-  const pos = positions[address];
-  if (!pos) { bot.sendMessage(chatId, '❌ Position not found.'); return; }
-  const orders = pos.customTpOrders || state.tpOrders;
-  const isCustom = !!pos.customTpOrders;
-  const keyboard = [];
-  const k = addrKey(address);
-
-  for (let i = 0; i < orders.length; i++) {
-    const t = orders[i];
-    keyboard.push([
-      { text: (pos.tpHits?.[i] ? '✅' : '🟢') + ' TP' + (i+1), callback_data: 'noop' },
-      { text: '🎯 +' + t.pct + '%', callback_data: 'tpep_' + k + '_' + i },
-      { text: '💰 ' + t.sellPct + '%', callback_data: 'tpes_' + k + '_' + i },
-      { text: '🗑', callback_data: 'tpd_' + k + '_' + i },
-    ]);
-  }
-  keyboard.push([
-    { text: '➕ Add TP', callback_data: 'tpa_' + k },
-    isCustom ? { text: '🔄 Reset to Global', callback_data: 'tpr_' + k } : { text: 'ℹ️ Using Global', callback_data: 'noop' },
-  ]);
-  keyboard.push([{ text: '◀️ Back', callback_data: 'pd_' + k }]);
-
-  bot.sendMessage(chatId,
-    '*' + pos.coinName + ' TP Config*\n' + (isCustom ? '🟡 Custom active' : '🔵 Using global') + '\n\nTap 🎯 or 💰 to edit, 🗑 to delete.',
-    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
-  );
-}
-
-// ── Global TP manager ─────────────────────────────────────────────────────────
+// ── Global TP Manager ─────────────────────────────────────────────────────────
 function sendGlobalTpManager(chatId) {
   const orders = state.tpOrders;
   const keyboard = [];
-
   for (let i = 0; i < orders.length; i++) {
     const t = orders[i];
     keyboard.push([
       { text: '🟢 TP' + (i+1), callback_data: 'noop' },
-      { text: '🎯 +' + t.pct + '%', callback_data: 'gtpep_' + i },
-      { text: '💰 ' + t.sellPct + '%', callback_data: 'gtpes_' + i },
-      { text: '🗑', callback_data: 'gtpd_' + i },
+      { text: '🎯 +' + t.pct + '%', callback_data: 'gtp_trg_' + i },
+      { text: '💰 ' + t.sellPct + '%', callback_data: 'gtp_sel_' + i },
+      { text: '🗑', callback_data: 'gtp_del_' + i },
     ]);
   }
-  keyboard.push([{ text: '➕ Add TP', callback_data: 'gtpa' }, { text: '◀️ Back', callback_data: 'watcher_panel' }]);
+  keyboard.push([{ text: '➕ Add TP', callback_data: 'gtp_add' }, { text: '◀️ Listener', callback_data: 'listener' }]);
 
   bot.sendMessage(chatId,
-    '*📈 Global TP Orders*\n\nApply to all coins unless overridden.\nTap 🎯 trigger or 💰 sell % to edit.',
+    '*📈 Global TP Orders*\n\nApply to all coins unless overridden per-coin.\nTap 🎯 to edit trigger, 💰 to edit sell %.',
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
   );
 }
 
-// ── Balance ───────────────────────────────────────────────────────────────────
-function sendBalanceMsg(chatId) {
-  const buyerBal = getBalance(BUYER_WALLET);
-  const dcaBal   = getBalance(DCA_WALLET);
-  const bEth = buyerBal?.wallet?.[0]?.balance || '?';
-  const bUsd = buyerBal?.wallet?.[0]?.usdValue?.toFixed(2) || '?';
-  const dEth = dcaBal?.wallet?.[0]?.balance || '?';
-  const dUsd = dcaBal?.wallet?.[0]?.usdValue?.toFixed(2) || '?';
+// ── Per-coin TP Manager ───────────────────────────────────────────────────────
+function sendCoinTpManager(chatId, address) {
+  const pos = positions[address];
+  if (!pos) { bot.sendMessage(chatId, '❌ Position not found.'); return; }
+  const k = addrKey(address);
+  const orders = pos.customTpOrders || state.tpOrders;
+  const isCustom = !!pos.customTpOrders;
+  const keyboard = [];
+
+  for (let i = 0; i < orders.length; i++) {
+    const t = orders[i];
+    keyboard.push([
+      { text: (pos.tpHits?.[i] ? '✅' : '⬜') + ' TP' + (i+1), callback_data: 'noop' },
+      { text: '🎯 +' + t.pct + '%', callback_data: 'ctp_trg_' + k + '_' + i },
+      { text: '💰 ' + t.sellPct + '%', callback_data: 'ctp_sel_' + k + '_' + i },
+      { text: '🗑', callback_data: 'ctp_del_' + k + '_' + i },
+    ]);
+  }
+  keyboard.push([
+    { text: '➕ Add TP', callback_data: 'ctp_add_' + k },
+    isCustom ? { text: '🔄 Reset to Global', callback_data: 'ctp_rst_' + k } : { text: 'ℹ️ Using Global', callback_data: 'noop' },
+  ]);
+  keyboard.push([{ text: '◀️ Back', callback_data: 'pd_' + k }]);
 
   bot.sendMessage(chatId,
-    '*💰 Wallets*\n\n🔵 Buyer: *' + bEth + ' ETH* (~$' + bUsd + ')\n🟣 DCA: *' + dEth + ' ETH* (~$' + dUsd + ')',
-    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '◀️ Main Menu', callback_data: 'main_menu' }]] }}
+    '*' + pos.coinName + ' TPs*\n' + (isCustom ? '🟡 Custom override active' : '🔵 Using global TPs') + '\n\nTap 🎯 trigger or 💰 sell % to edit.',
+    { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
   );
 }
 
-// ── Callback queries ──────────────────────────────────────────────────────────
+// ── TP picker helpers (button-based, no text input) ───────────────────────────
+function tpTriggerPicker(callback_prefix) {
+  const pcts = [5, 10, 15, 20, 25, 30, 40, 50, 75, 100, 150, 200, 300, 500];
+  const rows = [];
+  for (let i = 0; i < pcts.length; i += 4) {
+    rows.push(pcts.slice(i, i+4).map(p => ({ text: '+' + p + '%', callback_data: callback_prefix + p })));
+  }
+  return rows;
+}
+function tpSellPicker(callback_prefix) {
+  const pcts = [10, 20, 25, 33, 50, 67, 75, 100];
+  const rows = [];
+  for (let i = 0; i < pcts.length; i += 4) {
+    rows.push(pcts.slice(i, i+4).map(p => ({ text: p + '%', callback_data: callback_prefix + p })));
+  }
+  return rows;
+}
+
+// ── Settings Panel ────────────────────────────────────────────────────────────
+async function sendSettingsPanel(chatId) {
+  const amtLine = await buyAmountLine();
+  bot.sendMessage(chatId,
+    '*⚙️ Settings*\n\n' +
+    '🤖 Bot name: *' + (state.botName || 'SelectaBot') + '*\n' +
+    '💰 Default buy: *' + amtLine + '*\n' +
+    '🔄 Amount mode: *' + state.buyAmountMode.toUpperCase() + '*\n' +
+    '🛡 Global SL: *-' + state.stopLossPct + '%*\n' +
+    '👁 Price watcher: *' + (state.watcherPriceCheckEnabled ? 'ON' : 'OFF') + '*',
+    {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [{ text: '✏️ /setname', callback_data: 'set_name' }],
+        [{ text: '💰 Buy Amount', callback_data: 'set_amount' }, { text: state.buyAmountMode === 'eth' ? '💵 Switch to USD' : '🔷 Switch to ETH', callback_data: 'set_mode_toggle' }],
+        [{ text: '🛡 Global SL', callback_data: 'set_sl' }],
+        [{ text: state.watcherPriceCheckEnabled ? '🙈 Pause Price Watcher' : '👁 Resume Price Watcher', callback_data: 'set_watcher_toggle' }],
+        [{ text: '◀️ Home', callback_data: 'home' }],
+      ]}
+    }
+  );
+}
+
+// ── Message handler ────────────────────────────────────────────────────────────
+bot.on('message', async (msg) => {
+  const chatId  = msg.chat.id;
+  const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+  const isAdmin = msg.from?.id === ADMIN_ID;
+  const text    = msg.text || msg.caption || '';
+
+  // Group message: extract zora addresses and buy
+  if (isGroup) {
+    if (!state.watcherEnabled) return;
+    const addrs = extractAddresses(text);
+    for (const addr of addrs) {
+      await handleGroupBuy(addr, msg.chat.title, msg.from?.username || msg.from?.first_name || 'unknown');
+    }
+    return;
+  }
+
+  // Private: only admin
+  if (msg.chat.type !== 'private') return;
+  if (!isAdmin) { bot.sendMessage(chatId, '⛔ Unauthorized.'); return; }
+
+  // Active wizard
+  const sess = sessions[chatId];
+  if (sess && !text.startsWith('/')) {
+    await handleWizardInput(chatId, text, sess);
+    return;
+  }
+  if (sess && text.startsWith('/')) delete sessions[chatId];
+
+  // /setname command
+  if (text.startsWith('/setname ')) {
+    const name = text.replace('/setname ', '').trim();
+    if (name.length > 0 && name.length <= 32) {
+      state.botName = name;
+      saveState(state);
+      bot.sendMessage(chatId, '✅ Bot name set to *' + name + '*', { parse_mode: 'Markdown' });
+    } else {
+      bot.sendMessage(chatId, '❌ Name must be 1-32 chars.');
+    }
+    return;
+  }
+
+  // Raw address -> scan
+  const rawAddr = text.trim().match(/^(0x[a-fA-F0-9]{40})$/);
+  if (rawAddr) { await scanToken(chatId, rawAddr[1]); return; }
+
+  // Commands
+  if (text === '/start' || text === '/home' || text === '/menu') { await sendMainMenu(chatId); }
+  else if (text === '/positions') { await sendPositionsPanel(chatId); }
+  else if (text === '/wallets' || text === '/balance') { await sendWalletsPanel(chatId); }
+  else if (text === '/cancel') { delete sessions[chatId]; bot.sendMessage(chatId, '✅ Cancelled.'); await sendMainMenu(chatId); }
+  else { await sendMainMenu(chatId); }
+});
+
+// ── Wizard input handler ───────────────────────────────────────────────────────
+async function handleWizardInput(chatId, text, sess) {
+  const val = text.trim();
+
+  // ── New basket wizard ──
+  if (sess.type === 'basket_new') {
+    if (sess.step === 'name') {
+      if (!val || val.length > 32) { bot.sendMessage(chatId, '❌ Name must be 1-32 chars:'); return; }
+      sess.data.name = val;
+      sess.step = 'mode';
+      bot.sendMessage(chatId, '📊 *Select mode for "' + val + '"*', {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [
+          [{ text: '📈 Leaderboard', callback_data: 'bnw_mode_leaderboard' }],
+          [{ text: '🪙 Specific Coins', callback_data: 'bnw_mode_coins' }],
+        ]}
+      });
+    }
+    return;
+  }
+
+  // ── Basket field edits (text input) ──
+  if (sess.type === 'basket_field') {
+    const basket = findBasketByShort(sess.basketSid);
+    if (!basket) { bot.sendMessage(chatId, '❌ Basket not found.'); delete sessions[chatId]; return; }
+    const field = sess.field;
+    const v = parseFloat(val);
+
+    if (field === 'name') {
+      if (!val || val.length > 32) { bot.sendMessage(chatId, '❌ Name 1-32 chars:'); return; }
+      basket.name = val;
+    } else if (field === 'eth') {
+      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid ETH:'); return; }
+      basket.ethPerCoin = v;
+    } else if (field === 'budget') {
+      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid ETH:'); return; }
+      basket.totalBudget = v;
+    } else if (field === 'maxruns') {
+      const n = parseInt(val);
+      if (isNaN(n) || n < 1) { bot.sendMessage(chatId, '❌ Enter valid number:'); return; }
+      basket.maxRuns = n;
+    } else if (field === 'sl') {
+      if (isNaN(v) || v <= 0 || v > 100) { bot.sendMessage(chatId, '❌ Enter 1-100:'); return; }
+      basket.slPct = v;
+    } else if (field === 'mcap') {
+      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid number:'); return; }
+      basket.minMcap = v;
+    } else if (field === 'holders') {
+      const n = parseInt(val);
+      if (isNaN(n) || n < 1) { bot.sendMessage(chatId, '❌ Enter valid number:'); return; }
+      basket.minHolders = n;
+    } else if (field === 'maxcoins') {
+      const n = parseInt(val);
+      if (isNaN(n) || n < 1 || n > 50) { bot.sendMessage(chatId, '❌ Enter 1-50:'); return; }
+      basket.maxCoins = n;
+    } else if (field === 'coin_add') {
+      const addr = val.match(/0x[a-fA-F0-9]{40}/)?.[0]?.toLowerCase();
+      if (!addr) { bot.sendMessage(chatId, '❌ Invalid address:'); return; }
+      const coin = await fetchPrice(addr);
+      const name = coin?.name || addr.slice(0, 10) + '...';
+      basket.coins = basket.coins || [];
+      basket.coins.push({ address: addr, name });
+      addrKey(addr);
+      bot.sendMessage(chatId, '✅ Added *' + name + '* to basket.', { parse_mode: 'Markdown' });
+      saveState(state);
+      delete sessions[chatId];
+      sendBasketCoins(chatId, basket);
+      return;
+    }
+
+    saveState(state);
+    delete sessions[chatId];
+    bot.sendMessage(chatId, '✅ Updated *' + basket.name + '*', { parse_mode: 'Markdown' });
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+
+  // ── Listener buy amount (custom ETH) ──
+  if (sess.type === 'listener_amount') {
+    let v;
+    if (state.buyAmountMode === 'usd') {
+      const usd = parseFloat(val);
+      if (isNaN(usd) || usd <= 0) { bot.sendMessage(chatId, '❌ Enter valid USD amount:'); return; }
+      const ep = await getEthPrice();
+      v = usd / ep;
+    } else {
+      v = parseFloat(val);
+      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid ETH amount:'); return; }
+    }
+    state.ethAmount = parseFloat(v.toFixed(6));
+    saveState(state);
+    delete sessions[chatId];
+    bot.sendMessage(chatId, '✅ Buy amount set to ' + state.ethAmount + ' ETH');
+    await sendListenerPanel(chatId);
+    return;
+  }
+
+  // ── Global SL (custom %) ──
+  if (sess.type === 'global_sl') {
+    const v = parseFloat(val);
+    if (isNaN(v) || v <= 0 || v > 100) { bot.sendMessage(chatId, '❌ Enter 1-100:'); return; }
+    state.stopLossPct = v;
+    saveState(state);
+    delete sessions[chatId];
+    await sendListenerPanel(chatId);
+    return;
+  }
+
+  // ── Wallet transfer amount ──
+  if (sess.type === 'wallet_transfer') {
+    if (sess.step === 'amount') {
+      const v = parseFloat(val);
+      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid ETH:'); return; }
+      sess.data.amount = v;
+      sess.step = 'confirm';
+      const fromLabel = sess.data.fromIdx === 0 ? 'Listening' : 'DCA';
+      const toLabel = sess.data.fromIdx === 0 ? 'DCA' : 'Listening';
+      bot.sendMessage(chatId,
+        '💸 *Transfer Confirmation*\n\nSend *' + v + ' ETH* from ' + fromLabel + ' → ' + toLabel + '\n\nAre you sure?',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
+          { text: '✅ Confirm', callback_data: 'wtr_confirm_' + sess.data.fromIdx },
+          { text: '❌ Cancel', callback_data: 'wallets' },
+        ]]}}
+      );
+      return;
+    }
+  }
+
+  // ── Wallet cash out ──
+  if (sess.type === 'wallet_cashout') {
+    if (sess.step === 'address') {
+      const addr = val.match(/^(0x[a-fA-F0-9]{40})$/)?.[0];
+      if (!addr) { bot.sendMessage(chatId, '❌ Invalid address. Enter a valid 0x address:'); return; }
+      sess.data.toAddr = addr;
+      sess.step = 'amount';
+      bot.sendMessage(chatId, '💸 Enter ETH amount to send:');
+      return;
+    }
+    if (sess.step === 'amount') {
+      const v = parseFloat(val);
+      if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid ETH:'); return; }
+      sess.data.amount = v;
+      sess.step = 'confirm';
+      bot.sendMessage(chatId,
+        '💸 *Cash Out Confirmation*\n\nSend *' + v + ' ETH* to:\n`' + sess.data.toAddr + '`\n\nAre you sure?',
+        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
+          { text: '✅ Confirm', callback_data: 'wco_confirm_' + sess.data.walletIdx },
+          { text: '❌ Cancel', callback_data: 'wallets' },
+        ]]}}
+      );
+      return;
+    }
+  }
+
+  // ── Buy more (manual amount) ──
+  if (sess.type === 'buy_more') {
+    const v = parseFloat(val);
+    if (isNaN(v) || v <= 0) { bot.sendMessage(chatId, '❌ Enter valid ETH:'); return; }
+    const addr = sess.data.address;
+    const pos = positions[addr];
+    delete sessions[chatId];
+    const wallet = posWallet(pos);
+    const r = executeBuy(addr, v, wallet);
+    if (r.success) {
+      pos.ethSpent = (pos.ethSpent || 0) + v;
+      savePositions(positions);
+      const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
+      bot.sendMessage(chatId, '✅ Bought *' + v + ' ETH* of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+      await sendCoinDetail(chatId, addr);
+    } else {
+      bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' });
+    }
+    return;
+  }
+
+  // ── Manual sell % ──
+  if (sess.type === 'manual_sell') {
+    const pct = Math.min(100, Math.max(1, Math.round(parseFloat(val))));
+    if (isNaN(pct)) { bot.sendMessage(chatId, '❌ Enter 1-100:'); return; }
+    const addr = sess.data.address;
+    const pos = positions[addr];
+    delete sessions[chatId];
+    const wallet = posWallet(pos);
+    const r = executeSell(addr, pct, wallet);
+    if (r.success) {
+      if (pct === 100) pos.fullyExited = true;
+      savePositions(positions);
+      const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
+      bot.sendMessage(chatId, '✅ Sold *' + pct + '%* of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+      await sendCoinDetail(chatId, addr);
+    } else {
+      bot.sendMessage(chatId, '❌ Sell failed: `' + r.error + '`', { parse_mode: 'Markdown' });
+    }
+    return;
+  }
+
+  // ── Rename bot ──
+  if (sess.type === 'set_name') {
+    if (!val || val.length > 32) { bot.sendMessage(chatId, '❌ Name 1-32 chars:'); return; }
+    state.botName = val;
+    saveState(state);
+    delete sessions[chatId];
+    bot.sendMessage(chatId, '✅ Bot renamed to *' + val + '*', { parse_mode: 'Markdown' });
+    await sendSettingsPanel(chatId);
+    return;
+  }
+}
+
+// ── Callback handler ───────────────────────────────────────────────────────────
 bot.on('callback_query', async (query) => {
   const userId = query.from.id;
-  const data   = query.data;
+  const data   = query.data || '';
   const chatId = query.message.chat.id;
 
   if (userId !== ADMIN_ID) { bot.answerCallbackQuery(query.id, { text: '⛔ Unauthorized' }); return; }
-
   bot.answerCallbackQuery(query.id).catch(() => {});
 
   // ── Navigation ──
-  if (data === 'main_menu')      { sendMainMenu(chatId); }
-  else if (data === 'watcher_panel') { sendWatcherPanel(chatId); }
-  else if (data === 'dca_panel')     { sendDcaPanel(chatId); }
-  else if (data === 'growth_panel')  { sendGrowthPanel(chatId); }
-  else if (data === 'positions')     { sendPositionsList(chatId); }
-  else if (data === 'balance')       { sendBalanceMsg(chatId); }
-  else if (data === 'noop')          { /* do nothing */ }
-  else if (data === 'growth_status') { sendGrowthPanel(chatId); }
+  if (data === 'home')     { await sendMainMenu(chatId); return; }
+  if (data === 'listener') { await sendListenerPanel(chatId); return; }
+  if (data === 'dcap')     { sendDcaPanel(chatId); return; }
+  if (data === 'wallets')  { await sendWalletsPanel(chatId); return; }
+  if (data === 'posp')     { await sendPositionsPanel(chatId); return; }
+  if (data === 'setp')     { await sendSettingsPanel(chatId); return; }
+  if (data === 'noop')     { return; }
+  if (data === 'tp_global') { sendGlobalTpManager(chatId); return; }
 
-  // ── Watcher toggles ──
-  else if (data === 'w_toggle')       { state.watcherEnabled = !state.watcherEnabled; saveState(state); sendWatcherPanel(chatId); }
-  else if (data === 'w_mode')         { state.autoMode = !state.autoMode; saveState(state); sendWatcherPanel(chatId); }
-  else if (data === 'w_price_toggle') { state.watcherPriceCheckEnabled = !state.watcherPriceCheckEnabled; saveState(state); sendWatcherPanel(chatId); }
-  else if (data === 'w_amount' || data === 'wa_toggle_mode') {
-    if (data === 'wa_toggle_mode') {
-      state.buyAmountMode = state.buyAmountMode === 'eth' ? 'usd' : 'eth';
-      saveState(state);
+  // ── Listener toggles ──
+  if (data === 'w_toggle')        { state.watcherEnabled = !state.watcherEnabled; saveState(state); await sendListenerPanel(chatId); return; }
+  if (data === 'w_mode')          { state.autoMode = !state.autoMode; saveState(state); await sendListenerPanel(chatId); return; }
+  if (data === 'set_watcher_toggle') { state.watcherPriceCheckEnabled = !state.watcherPriceCheckEnabled; saveState(state); await sendSettingsPanel(chatId); return; }
+  if (data === 'set_mode_toggle') { state.buyAmountMode = state.buyAmountMode === 'eth' ? 'usd' : 'eth'; saveState(state); await sendSettingsPanel(chatId); return; }
+
+  if (data === 'w_amount' || data === 'set_amount') {
+    const ep = await getEthPrice();
+    const mode = state.buyAmountMode;
+    let presets;
+    if (mode === 'usd') {
+      const toEth = (u) => (u / ep).toFixed(5);
+      presets = [
+        [1, 2, 5, 10].map(u => ({ text: '$' + u, callback_data: 'wa_usd_' + u })),
+        [20, 50, 100].map(u => ({ text: '$' + u, callback_data: 'wa_usd_' + u }))
+          .concat([{ text: '✏️ Custom', callback_data: 'wa_custom' }]),
+      ];
+    } else {
+      presets = [
+        ['0.001','0.002','0.005','0.01'].map(v => ({ text: v + ' ETH (~$' + (parseFloat(v)*ep).toFixed(0) + ')', callback_data: 'wa_eth_' + v })),
+        ['0.02','0.05','0.1'].map(v => ({ text: v + ' ETH', callback_data: 'wa_eth_' + v }))
+          .concat([{ text: '✏️ Custom', callback_data: 'wa_custom' }]),
+      ];
     }
-    const mode = state.buyAmountMode || 'eth';
-    const currentDisplay = mode === 'usd'
-      ? '~$' + Math.round(state.ethAmount * cachedEthPrice) + ' USD'
-      : state.ethAmount + ' ETH';
-    const toggleLabel = mode === 'eth' ? '💵 Switch to USD' : '⚫ Switch to ETH';
-
-    const keyboard = mode === 'eth'
-      ? [
-          [{ text: '0.001', callback_data: 'wa_v0.001' }, { text: '0.002', callback_data: 'wa_v0.002' }, { text: '0.005', callback_data: 'wa_v0.005' }, { text: '0.01', callback_data: 'wa_v0.01' }],
-          [{ text: '0.02', callback_data: 'wa_v0.02' }, { text: '0.05', callback_data: 'wa_v0.05' }, { text: '✏️ Custom', callback_data: 'wa_custom' }],
-          [{ text: toggleLabel, callback_data: 'wa_toggle_mode' }],
-        ]
-      : [
-          [{ text: '$1', callback_data: 'wau_1' }, { text: '$2', callback_data: 'wau_2' }, { text: '$5', callback_data: 'wau_5' }, { text: '$10', callback_data: 'wau_10' }],
-          [{ text: '$25', callback_data: 'wau_25' }, { text: '$50', callback_data: 'wau_50' }, { text: '✏️ Custom', callback_data: 'wa_custom' }],
-          [{ text: toggleLabel, callback_data: 'wa_toggle_mode' }],
-        ];
-
-    bot.sendMessage(chatId, '💰 *Set Buy Amount* (current: ' + currentDisplay + ')', {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: keyboard }
+    bot.sendMessage(chatId, '💰 *Set Buy Amount* (mode: ' + mode.toUpperCase() + ')\nCurrent: ' + state.ethAmount + ' ETH', {
+      parse_mode: 'Markdown', reply_markup: { inline_keyboard: presets }
     });
+    return;
   }
-  else if (data.startsWith('wa_v')) {
-    const eth = parseFloat(data.replace('wa_v', ''));
-    state.ethAmount = eth; state.buyAmountMode = 'eth'; saveState(state);
-    bot.answerCallbackQuery(query.id, { text: '✅ ' + eth + ' ETH' });
-    sendWatcherPanel(chatId);
+  if (data.startsWith('wa_eth_')) {
+    const v = parseFloat(data.replace('wa_eth_', ''));
+    if (!isNaN(v)) { state.ethAmount = v; saveState(state); }
+    await sendListenerPanel(chatId);
+    return;
   }
-  else if (data.startsWith('wau_')) {
-    const usd = parseFloat(data.replace('wau_', ''));
-    const eth = parseFloat((usd / cachedEthPrice).toFixed(5));
-    state.ethAmount = eth; state.buyAmountMode = 'usd'; saveState(state);
-    bot.answerCallbackQuery(query.id, { text: '✅ ~$' + usd + ' (' + eth + ' ETH)' });
-    sendWatcherPanel(chatId);
+  if (data.startsWith('wa_usd_')) {
+    const usd = parseFloat(data.replace('wa_usd_', ''));
+    const ep = await getEthPrice();
+    state.ethAmount = parseFloat((usd / ep).toFixed(6));
+    saveState(state);
+    await sendListenerPanel(chatId);
+    return;
   }
-  else if (data.startsWith('wa_')) {
-    const v = data.replace('wa_', '');
-    if (v === 'custom') {
-      sessions[chatId] = { type: 'set_buy_amount', createdAt: Date.now() };
-      bot.sendMessage(chatId, 'Enter amount (e.g. `0.01` ETH or `$10` USD):', { parse_mode: 'Markdown' });
-    }
+  if (data === 'wa_custom') {
+    sessions[chatId] = { type: 'listener_amount', createdAt: Date.now() };
+    const mode = state.buyAmountMode;
+    bot.sendMessage(chatId, '✏️ Enter custom ' + (mode === 'usd' ? 'USD' : 'ETH') + ' amount:');
+    return;
   }
-  else if (data === 'w_sl') {
+
+  if (data === 'w_sl') {
     bot.sendMessage(chatId, '📉 *Stop-Loss* (current: -' + state.stopLossPct + '%)', {
       parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[
-        { text: '-5%', callback_data: 'wsl_5' }, { text: '-10%', callback_data: 'wsl_10' },
-        { text: '-15%', callback_data: 'wsl_15' }, { text: '-20%', callback_data: 'wsl_20' },
-        { text: '-25%', callback_data: 'wsl_25' }, { text: '-30%', callback_data: 'wsl_30' },
-      ]]}
-    });
-  }
-  else if (data.startsWith('wsl_')) { state.stopLossPct = parseInt(data.replace('wsl_', '')); saveState(state); sendWatcherPanel(chatId); }
-
-  // ── DCA controls ──
-  else if (data === 'dca_toggle') {
-    state.dca.enabled = !state.dca.enabled;
-    if (state.dca.enabled && !state.dca.nextDcaAt) state.dca.nextDcaAt = Date.now() + state.dca.intervalHours * 3600000;
-    saveState(state); sendDcaPanel(chatId);
-  }
-  else if (data === 'dca_runnow') { bot.sendMessage(chatId, '⚡ Running DCA now...'); runDcaCycle(); }
-  else if (data === 'dca_add_custom') {
-    sessions[chatId] = { type: 'dca_custom', step: 'address', data: {}, createdAt: Date.now() };
-    bot.sendMessage(chatId, '➕ *Add Custom DCA Coin*\n\nPaste the contract address:', { parse_mode: 'Markdown' });
-  }
-  else if (data.startsWith('dca_rm_')) {
-    const i = parseInt(data.replace('dca_rm_', ''));
-    state.dca.customCoins.splice(i, 1);
-    saveState(state); sendDcaPanel(chatId);
-  }
-  else if (data === 'dca_interval') {
-    bot.sendMessage(chatId, '⏱ *DCA Interval* (current: ' + state.dca.intervalHours + 'h)', {
-      parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: [
-        [{ text: '1h', callback_data: 'di_1' }, { text: '4h', callback_data: 'di_4' }, { text: '6h', callback_data: 'di_6' }, { text: '12h', callback_data: 'di_12' }],
-        [{ text: '24h', callback_data: 'di_24' }, { text: '48h', callback_data: 'di_48' }, { text: '1 week', callback_data: 'di_168' }, { text: '1 month', callback_data: 'di_720' }],
+        [5,10,15,20].map(v => ({ text: '-' + v + '%', callback_data: 'wsl_' + v })),
+        [25,30,40,50].map(v => ({ text: '-' + v + '%', callback_data: 'wsl_' + v })),
       ]}
     });
+    return;
   }
-  else if (data.startsWith('di_')) { state.dca.intervalHours = parseInt(data.replace('di_', '')); scheduleDca(); saveState(state); sendDcaPanel(chatId); }
-  else if (data === 'dca_eth') {
-    const dcaBal = getBalance(DCA_WALLET);
-    const dcaAvail = parseFloat(dcaBal?.wallet?.[0]?.balance || '0').toFixed(4);
-    bot.sendMessage(chatId, '💎 *ETH per coin* (current: ' + state.dca.ethPerCoin + ')\n💰 DCA wallet: *' + dcaAvail + ' ETH* available', {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[
-        { text: '0.001', callback_data: 'de_001' }, { text: '0.002', callback_data: 'de_002' },
-        { text: '0.005', callback_data: 'de_005' }, { text: '0.01', callback_data: 'de_01' },
-      ]]}
-    });
-  }
-  else if (data.startsWith('de_')) {
-    const map = { '001': 0.001, '002': 0.002, '005': 0.005, '01': 0.01 };
-    state.dca.ethPerCoin = map[data.replace('de_', '')] || 0.002;
-    saveState(state); sendDcaPanel(chatId);
-  }
-  else if (data === 'dca_mcap') {
-    bot.sendMessage(chatId, '🏦 *Min Mcap* (current: $' + state.dca.minMcap.toLocaleString() + ')', {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[
-        { text: '$10k', callback_data: 'dm_10k' }, { text: '$50k', callback_data: 'dm_50k' },
-        { text: '$100k', callback_data: 'dm_100k' }, { text: '$500k', callback_data: 'dm_500k' },
-      ]]}
-    });
-  }
-  else if (data.startsWith('dm_')) {
-    const map = { '10k': 10000, '50k': 50000, '100k': 100000, '500k': 500000 };
-    state.dca.minMcap = map[data.replace('dm_', '')] || 100000;
-    saveState(state); sendDcaPanel(chatId);
-  }
-  else if (data === 'dca_holders') {
-    bot.sendMessage(chatId, '👥 *Min Holders* (current: ' + state.dca.minHolders + ')', {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [[
-        { text: '100', callback_data: 'dh_100' }, { text: '500', callback_data: 'dh_500' },
-        { text: '1000', callback_data: 'dh_1000' }, { text: '5000', callback_data: 'dh_5000' },
-      ]]}
-    });
-  }
-  else if (data.startsWith('dh_')) {
-    state.dca.minHolders = parseInt(data.replace('dh_', '')); saveState(state); sendDcaPanel(chatId);
-  }
+  if (data.startsWith('wsl_')) { state.stopLossPct = parseInt(data.slice(4)); saveState(state); await sendListenerPanel(chatId); return; }
 
-  // ── Growth engine ──
-  // Growth engine preset buttons
-  else if (data.startsWith('geth_')) {
-    const sess = sessions[chatId];
-    if (!sess || sess.type !== 'growth') return;
-    const v = data.replace('geth_', '');
-    if (v === 'custom') {
-      bot.sendMessage(chatId, '✏️ Enter total ETH amount:');
-    } else {
-      // v starts with 'v' prefix e.g. 'v0.005'
-      const eth = parseFloat(v.replace('v', ''));
-      if (isNaN(eth) || eth <= 0) { bot.sendMessage(chatId, '❌ Invalid amount.'); return; }
-      sess.data.totalEth = eth;
-      sess.step = 'num_buys';
-      bot.sendMessage(chatId, 'Number of buys:', {
-        reply_markup: { inline_keyboard: [
-          [{ text: '3', callback_data: 'gbuys_3' }, { text: '5', callback_data: 'gbuys_5' }, { text: '10', callback_data: 'gbuys_10' }, { text: '20', callback_data: 'gbuys_20' }],
-          [{ text: '30', callback_data: 'gbuys_30' }, { text: '50', callback_data: 'gbuys_50' }, { text: '✏️ Custom', callback_data: 'gbuys_custom' }],
-        ]}
-      });
-    }
-  }
-  else if (data.startsWith('gbuys_')) {
-    const sess = sessions[chatId];
-    if (!sess || sess.type !== 'growth') return;
-    const v = data.replace('gbuys_', '');
-    if (v === 'custom') {
-      bot.sendMessage(chatId, '✏️ Enter number of buys:');
-    } else {
-      sess.data.numBuys = parseInt(v);
-      sess.step = 'interval';
-      bot.sendMessage(chatId, 'Interval between buys:', {
-        reply_markup: { inline_keyboard: [
-          [{ text: '30s', callback_data: 'gint_0.5' }, { text: '1 min', callback_data: 'gint_1' }, { text: '2 min', callback_data: 'gint_2' }, { text: '5 min', callback_data: 'gint_5' }],
-          [{ text: '10 min', callback_data: 'gint_10' }, { text: '30 min', callback_data: 'gint_30' }, { text: '1 hour', callback_data: 'gint_60' }, { text: '✏️ Custom', callback_data: 'gint_custom' }],
-        ]}
-      });
-    }
-  }
-  else if (data.startsWith('gint_')) {
-    const sess = sessions[chatId];
-    if (!sess || sess.type !== 'growth') return;
-    const v = data.replace('gint_', '');
-    if (v === 'custom') {
-      bot.sendMessage(chatId, '✏️ Enter interval in minutes (e.g. 1):');
-    } else {
-      const mins = parseFloat(v);
-      sess.data.intervalMin = mins;
-      const ethPerBuy = (sess.data.totalEth / sess.data.numBuys).toFixed(5);
-      sess.step = 'confirm';
-      bot.sendMessage(chatId,
-        '🚀 *Confirm Growth Engine*\n\nCoin: *' + sess.data.coinName + '*\n~' + ethPerBuy + ' ETH every ~' + mins + ' min × ' + sess.data.numBuys + ' buys\nTotal: ~*' + sess.data.totalEth + ' ETH*\n🎲 ±15% jitter on amount & timing',
-        { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
-          { text: '✅ Start', callback_data: 'growth_confirm' },
-          { text: '❌ Cancel', callback_data: 'growth_cancel' },
-        ]]}}
-      );
-    }
-  }
-  else if (data === 'growth_new') {
-    sessions[chatId] = { type: 'growth', step: 'address', data: {}, createdAt: Date.now() };
-    bot.sendMessage(chatId, '🚀 *New Growth Engine*\n\nPaste coin address:', { parse_mode: 'Markdown' });
-  }
-  else if (data.startsWith('pgrowth_')) {
-    const addr = addrFromKey(data.replace('pgrowth_', ''));
-    const pos = positions[addr];
-    const coinName = pos?.coinName || addr.slice(0, 10) + '...';
-    // Pre-fill address, skip straight to ETH amount step
-    sessions[chatId] = { type: 'growth', step: 'total_eth', data: { address: addr, coinName }, createdAt: Date.now() };
-    const buyerBal = getBalance(BUYER_WALLET);
-    const availEth = parseFloat(buyerBal?.wallet?.[0]?.balance || '0').toFixed(4);
-    bot.sendMessage(chatId, '🚀 *Growth Engine — ' + coinName + '*\n\n💰 Buyer wallet: *' + availEth + ' ETH* available\n\nTotal ETH to spend:', {
+  if (data === 'set_sl') {
+    bot.sendMessage(chatId, '🛡 *Global Stop-Loss* (current: -' + state.stopLossPct + '%)', {
       parse_mode: 'Markdown',
       reply_markup: { inline_keyboard: [
-        [{ text: '0.005', callback_data: 'geth_v0.005' }, { text: '0.01', callback_data: 'geth_v0.01' }, { text: '0.02', callback_data: 'geth_v0.02' }, { text: '0.05', callback_data: 'geth_v0.05' }],
-        [{ text: '0.1', callback_data: 'geth_v0.1' }, { text: '0.5', callback_data: 'geth_v0.5' }, { text: '✏️ Custom', callback_data: 'geth_custom' }],
+        [5,10,15,20].map(v => ({ text: '-' + v + '%', callback_data: 'ssl_' + v })),
+        [25,30,40,50].map(v => ({ text: '-' + v + '%', callback_data: 'ssl_' + v })),
+        [{ text: '✏️ Custom', callback_data: 'ssl_custom' }],
       ]}
     });
+    return;
   }
-  else if (data === 'growth_confirm') {
+  if (data.startsWith('ssl_')) {
+    const v = data.slice(4);
+    if (v === 'custom') { sessions[chatId] = { type: 'global_sl', createdAt: Date.now() }; bot.sendMessage(chatId, 'Enter SL %:'); }
+    else { state.stopLossPct = parseInt(v); saveState(state); await sendSettingsPanel(chatId); }
+    return;
+  }
+
+  if (data === 'set_name') {
+    sessions[chatId] = { type: 'set_name', createdAt: Date.now() };
+    bot.sendMessage(chatId, '✏️ Enter new bot name (max 32 chars):');
+    return;
+  }
+
+  // ── DCA / Basket ──
+  if (data === 'b_new') {
+    sessions[chatId] = { type: 'basket_new', step: 'name', data: {}, createdAt: Date.now() };
+    bot.sendMessage(chatId, '🆕 *New Basket*\n\nEnter a name:', { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // New basket wizard: mode selection
+  if (data.startsWith('bnw_mode_')) {
     const sess = sessions[chatId];
-    if (!sess || sess.type !== 'growth' || sess.step !== 'confirm') { bot.sendMessage(chatId, '⚠️ No pending growth engine. Start a new one.'); return; }
-    const { address, coinName, totalEth, numBuys, intervalMin } = sess.data;
-    const ethPerBuy = totalEth / numBuys;
-    const engineId = 'ge_' + Date.now();
+    if (!sess || sess.type !== 'basket_new') { bot.sendMessage(chatId, '⚠️ Session expired. Start again.'); return; }
+    sess.data.mode = data.replace('bnw_mode_', '');
+    sess.step = 'interval';
+    bot.sendMessage(chatId, '⏱ *Interval between runs:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [{ text: '30 min', callback_data: 'bnw_int_30' }, { text: '1 hour', callback_data: 'bnw_int_60' }, { text: '4 hours', callback_data: 'bnw_int_240' }],
+        [{ text: '6 hours', callback_data: 'bnw_int_360' }, { text: '12 hours', callback_data: 'bnw_int_720' }],
+        [{ text: '24 hours', callback_data: 'bnw_int_1440' }, { text: '1 week', callback_data: 'bnw_int_10080' }],
+      ]}
+    });
+    return;
+  }
+
+  if (data.startsWith('bnw_int_')) {
+    const sess = sessions[chatId];
+    if (!sess || sess.type !== 'basket_new') return;
+    sess.data.intervalMinutes = parseInt(data.replace('bnw_int_', ''));
+    sess.step = 'eth';
+    const ep = await getEthPrice();
+    bot.sendMessage(chatId, '💎 *ETH per coin per run:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [0.001, 0.002, 0.005].map(v => ({ text: v + ' ETH (~$' + (v*ep).toFixed(0) + ')', callback_data: 'bnw_eth_' + v })),
+        [0.01, 0.02, 0.05].map(v => ({ text: v + ' ETH (~$' + (v*ep).toFixed(0) + ')', callback_data: 'bnw_eth_' + v })),
+      ]}
+    });
+    return;
+  }
+
+  if (data.startsWith('bnw_eth_')) {
+    const sess = sessions[chatId];
+    if (!sess || sess.type !== 'basket_new') return;
+    sess.data.ethPerCoin = parseFloat(data.replace('bnw_eth_', ''));
+    sess.step = 'budget';
+    bot.sendMessage(chatId, '💰 *Total budget (optional):*\nTotal ETH cap for this basket:', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [0.01, 0.05, 0.1, 0.5].map(v => ({ text: v + ' ETH', callback_data: 'bnw_bud_' + v })),
+        [{ text: '1 ETH', callback_data: 'bnw_bud_1' }, { text: '⏭ No Limit', callback_data: 'bnw_bud_none' }],
+      ]}
+    });
+    return;
+  }
+
+  if (data.startsWith('bnw_bud_')) {
+    const sess = sessions[chatId];
+    if (!sess || sess.type !== 'basket_new') return;
+    const v = data.replace('bnw_bud_', '');
+    sess.data.totalBudget = v === 'none' ? null : parseFloat(v);
+    // Create basket
+    const basket = {
+      id: genId(),
+      name: sess.data.name,
+      enabled: false,
+      intervalMinutes: sess.data.intervalMinutes,
+      ethPerCoin: sess.data.ethPerCoin,
+      totalBudget: sess.data.totalBudget,
+      totalSpent: 0,
+      maxRuns: null,
+      runsCompleted: 0,
+      nextRunAt: null,
+      lastRunAt: null,
+      mode: sess.data.mode,
+      minMcap: 100000,
+      minHolders: 1000,
+      maxCoins: 5,
+      coinType: 'all',
+      lbSort: 'mcap',
+      coins: [],
+      tpOrders: [...state.tpOrders],
+      slPct: 15,
+    };
+    state.dca.baskets = state.dca.baskets || [];
+    state.dca.baskets.push(basket);
+    saveState(state);
     delete sessions[chatId];
-    bot.sendMessage(chatId, '🚀 *Growth Engine Started!*\n*' + coinName + '*\n' + numBuys + ' buys ~' + ethPerBuy.toFixed(5) + ' ETH every ~' + intervalMin + ' min\n🎲 ±15% jitter on amount & timing', { parse_mode: 'Markdown' });
-    startGrowthEngine(engineId, address, coinName, numBuys, ethPerBuy, intervalMin * 60000, 0.15);
+    bot.sendMessage(chatId, '✅ Basket *' + basket.name + '* created!\n\nConfigure settings and enable when ready.', { parse_mode: 'Markdown' });
+    sendBasketDetail(chatId, basket);
+    return;
   }
-  else if (data === 'growth_cancel') { delete sessions[chatId]; bot.sendMessage(chatId, '❌ Growth engine cancelled.'); sendGrowthPanel(chatId); }
-  else if (data.startsWith('growth_stop_')) {
-    const id = Object.keys(activeEngines).find(k => k.startsWith(data.replace('growth_stop_', '').slice(0, 10)));
-    if (id && activeEngines[id]) {
-      const eng = activeEngines[id];
-      if (eng.timer) clearTimeout(eng.timer);
-      delete activeEngines[id];
-      bot.sendMessage(chatId, '🛑 Growth engine for *' + eng.coinName + '* cancelled.', { parse_mode: 'Markdown' });
+
+  // Basket detail / settings
+  if (data.startsWith('b_det_')) {
+    const sid = data.replace('b_det_', '');
+    const basket = findBasketByShort(sid);
+    if (!basket) { bot.sendMessage(chatId, '❌ Basket not found.'); return; }
+    sendBasketDetail(chatId, basket);
+    return;
+  }
+  if (data.startsWith('b_en_')) {
+    const basket = findBasketByShort(data.replace('b_en_', ''));
+    if (!basket) return;
+    basket.enabled = !basket.enabled;
+    if (basket.enabled && !basket.nextRunAt) basket.nextRunAt = Date.now() + basket.intervalMinutes * 60000;
+    saveState(state);
+    sendBasketDetail(chatId, basket);
+    return;
+  }
+  if (data.startsWith('b_run_')) {
+    const basket = findBasketByShort(data.replace('b_run_', ''));
+    if (!basket) return;
+    bot.sendMessage(chatId, '⚡ Running basket *' + basket.name + '*...', { parse_mode: 'Markdown' });
+    await runBasket(basket);
+    return;
+  }
+  if (data.startsWith('b_set_')) {
+    const basket = findBasketByShort(data.replace('b_set_', ''));
+    if (!basket) return;
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('b_coins_')) {
+    const basket = findBasketByShort(data.replace('b_coins_', ''));
+    if (!basket) return;
+    sendBasketCoins(chatId, basket);
+    return;
+  }
+  if (data.startsWith('b_pre_')) {
+    const basket = findBasketByShort(data.replace('b_pre_', ''));
+    if (!basket) return;
+    bot.sendMessage(chatId, '🔍 Fetching leaderboard preview...');
+    const coins = await getLeaderboard(basket);
+    if (!coins.length) { bot.sendMessage(chatId, '⚠️ No coins match the filter.'); return; }
+    const lines = coins.map((c, i) => (i+1) + '. *' + (c.name||c.address) + '*  $' + num(c.marketCap||0) + '  ' + (c.uniqueHolders||'?') + ' holders');
+    bot.sendMessage(chatId, '*' + basket.name + ' Preview*\n\n' + lines.join('\n'), { parse_mode: 'Markdown' });
+    return;
+  }
+  if (data.startsWith('b_del_')) {
+    const sid = data.replace('b_del_', '');
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    bot.sendMessage(chatId, '🗑 *Delete "' + basket.name + '"?*\nThis cannot be undone.', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[
+        { text: '✅ Delete', callback_data: 'b_del_confirm_' + sid },
+        { text: '❌ Cancel', callback_data: 'b_det_' + sid },
+      ]]}
+    });
+    return;
+  }
+  if (data.startsWith('b_del_confirm_')) {
+    const sid = data.replace('b_del_confirm_', '');
+    const idx = state.dca.baskets.findIndex(b => b.id.startsWith(sid));
+    if (idx >= 0) { const name = state.dca.baskets[idx].name; state.dca.baskets.splice(idx, 1); saveState(state); bot.sendMessage(chatId, '🗑 Deleted *' + name + '*', { parse_mode: 'Markdown' }); }
+    sendDcaPanel(chatId);
+    return;
+  }
+
+  // Basket settings field pickers
+  if (data.startsWith('bs_eth_')) {
+    const sid = data.replace('bs_eth_', '');
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    const ep = await getEthPrice();
+    bot.sendMessage(chatId, '💎 *ETH per coin* (current: ' + basket.ethPerCoin + ')', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [0.001, 0.002, 0.005].map(v => ({ text: v + ' ETH (~$' + (v*ep).toFixed(0) + ')', callback_data: 'bsv_eth_' + sid + '_' + v })),
+        [0.01, 0.02, 0.05].map(v => ({ text: v + ' ETH', callback_data: 'bsv_eth_' + sid + '_' + v }))
+          .concat([{ text: '✏️ Custom', callback_data: 'bsf_eth_' + sid }]),
+      ]}
+    });
+    return;
+  }
+  if (data.startsWith('bsv_eth_')) {
+    const parts = data.replace('bsv_eth_', '').split('_');
+    const v = parseFloat(parts.pop()); const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket || isNaN(v)) return;
+    basket.ethPerCoin = v; saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bsf_eth_')) {
+    const sid = data.replace('bsf_eth_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'eth', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '✏️ Enter ETH per coin:');
+    return;
+  }
+  if (data.startsWith('bs_int_')) {
+    const sid = data.replace('bs_int_', '');
+    bot.sendMessage(chatId, '⏱ *Select interval:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [{ text: '30 min', callback_data: 'bsv_int_' + sid + '_30' }, { text: '1h', callback_data: 'bsv_int_' + sid + '_60' }, { text: '4h', callback_data: 'bsv_int_' + sid + '_240' }],
+        [{ text: '6h', callback_data: 'bsv_int_' + sid + '_360' }, { text: '12h', callback_data: 'bsv_int_' + sid + '_720' }],
+        [{ text: '24h', callback_data: 'bsv_int_' + sid + '_1440' }, { text: '1 week', callback_data: 'bsv_int_' + sid + '_10080' }],
+      ]}
+    });
+    return;
+  }
+  if (data.startsWith('bsv_int_')) {
+    const parts = data.replace('bsv_int_', '').split('_');
+    const v = parseInt(parts.pop()); const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket || isNaN(v)) return;
+    basket.intervalMinutes = v; saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bs_maxr_')) {
+    const sid = data.replace('bs_maxr_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'maxruns', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '🔢 Enter max runs (or type 0 for unlimited):');
+    return;
+  }
+  if (data.startsWith('bs_bud_')) {
+    const sid = data.replace('bs_bud_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'budget', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '💰 Enter total ETH budget:');
+    return;
+  }
+  if (data.startsWith('bs_sl_')) {
+    const sid = data.replace('bs_sl_', '');
+    bot.sendMessage(chatId, '🛡 *Basket Stop-Loss:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [5,10,15,20].map(v => ({ text: '-' + v + '%', callback_data: 'bsv_sl_' + sid + '_' + v })),
+        [25,30,40,50].map(v => ({ text: '-' + v + '%', callback_data: 'bsv_sl_' + sid + '_' + v })),
+        [{ text: '✏️ Custom', callback_data: 'bsf_sl_' + sid }],
+      ]}
+    });
+    return;
+  }
+  if (data.startsWith('bsv_sl_')) {
+    const parts = data.replace('bsv_sl_', '').split('_');
+    const v = parseInt(parts.pop()); const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket || isNaN(v)) return;
+    basket.slPct = v; saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bsf_sl_')) {
+    const sid = data.replace('bsf_sl_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'sl', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '✏️ Enter SL % (e.g. 15):');
+    return;
+  }
+  if (data.startsWith('bs_mode_')) {
+    const sid = data.replace('bs_mode_', '');
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    basket.mode = basket.mode === 'leaderboard' ? 'coins' : 'leaderboard';
+    saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bs_sort_')) {
+    const sid = data.replace('bs_sort_', '');
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    const sorts = ['mcap', 'volume', 'holders'];
+    basket.lbSort = sorts[(sorts.indexOf(basket.lbSort) + 1) % sorts.length];
+    saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bs_mcap_')) {
+    const sid = data.replace('bs_mcap_', '');
+    bot.sendMessage(chatId, '🏦 *Min Mcap:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [10000, 50000, 100000, 500000].map(v => ({ text: '$' + num(v), callback_data: 'bsv_mcap_' + sid + '_' + v })),
+        [{ text: '✏️ Custom', callback_data: 'bsf_mcap_' + sid }],
+      ]}
+    });
+    return;
+  }
+  if (data.startsWith('bsv_mcap_')) {
+    const parts = data.replace('bsv_mcap_', '').split('_');
+    const v = parseInt(parts.pop()); const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket || isNaN(v)) return;
+    basket.minMcap = v; saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bsf_mcap_')) {
+    const sid = data.replace('bsf_mcap_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'mcap', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '✏️ Enter min mcap in USD (e.g. 100000):');
+    return;
+  }
+  if (data.startsWith('bs_hld_')) {
+    const sid = data.replace('bs_hld_', '');
+    bot.sendMessage(chatId, '👥 *Min Holders:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [100, 500, 1000, 5000].map(v => ({ text: v, callback_data: 'bsv_hld_' + sid + '_' + v })),
+      ]}
+    });
+    return;
+  }
+  if (data.startsWith('bsv_hld_')) {
+    const parts = data.replace('bsv_hld_', '').split('_');
+    const v = parseInt(parts.pop()); const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket || isNaN(v)) return;
+    basket.minHolders = v; saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bs_mc_')) {
+    const sid = data.replace('bs_mc_', '');
+    bot.sendMessage(chatId, '🔢 *Max coins per run:*', {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [
+        [1,2,3,5,8,10].map(v => ({ text: v, callback_data: 'bsv_mc_' + sid + '_' + v })),
+      ]}
+    });
+    return;
+  }
+  if (data.startsWith('bsv_mc_')) {
+    const parts = data.replace('bsv_mc_', '').split('_');
+    const v = parseInt(parts.pop()); const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket || isNaN(v)) return;
+    basket.maxCoins = v; saveState(state);
+    await sendBasketSettings(chatId, basket);
+    return;
+  }
+  if (data.startsWith('bs_name_')) {
+    const sid = data.replace('bs_name_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'name', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '✏️ Enter new basket name:');
+    return;
+  }
+  if (data.startsWith('bs_tp_')) {
+    const sid = data.replace('bs_tp_', '');
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    // Show basket TP manager
+    const keyboard = [];
+    for (let i = 0; i < basket.tpOrders.length; i++) {
+      const t = basket.tpOrders[i];
+      keyboard.push([
+        { text: 'TP' + (i+1), callback_data: 'noop' },
+        { text: '🎯 +' + t.pct + '%', callback_data: 'btp_trg_' + sid + '_' + i },
+        { text: '💰 ' + t.sellPct + '%', callback_data: 'btp_sel_' + sid + '_' + i },
+        { text: '🗑', callback_data: 'btp_del_' + sid + '_' + i },      ]);
     }
-    sendGrowthPanel(chatId);
+    keyboard.push([
+      { text: '➕ Add TP', callback_data: 'btp_add_' + sid },
+      { text: '◀️ Back', callback_data: 'b_set_' + sid },
+    ]);
+    bot.sendMessage(chatId,
+      '*' + basket.name + ' — TP Orders*\n\nTap 🎯 trigger or 💰 sell % to edit.',
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: keyboard } }
+    );
+    return;
+  }
+
+  // Basket TP edits (button-based trigger picker -> sell picker)
+  if (data.startsWith('btp_add_')) {
+    const sid = data.replace('btp_add_', '');
+    sessions[chatId] = { type: 'btp_pick', step: 'trg', basketSid: sid, idx: -1, createdAt: Date.now() };
+    const rows = tpTriggerPicker('btp_trg_v_' + sid + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'bs_tp_' + sid }]);
+    bot.sendMessage(chatId, '➕ *Add TP — Trigger %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('btp_trg_v_')) {
+    // btp_trg_v_{sid}_{pct} — from picker
+    const rest = data.replace('btp_trg_v_', '');
+    const lastU = rest.lastIndexOf('_');
+    const sid = rest.slice(0, lastU); const pct = parseInt(rest.slice(lastU+1));
+    const sess = sessions[chatId];
+    if (!sess) return;
+    sess.data = sess.data || {};
+    sess.data.pct = pct;
+    sess.step = 'sel';
+    const rows = tpSellPicker('btp_sel_v_' + sid + '_' + sess.idx + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'bs_tp_' + sid }]);
+    bot.sendMessage(chatId, '➕ *TP +' + pct + '% — Sell %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('btp_sel_v_')) {
+    const rest = data.replace('btp_sel_v_', '');
+    const parts = rest.split('_');
+    const sellPct = parseInt(parts.pop());
+    const idx_str = parts.pop(); const idx = parseInt(idx_str);
+    const sid = parts.join('_');
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    const sess = sessions[chatId];
+    const pct = sess?.data?.pct;
+    if (!pct) return;
+    if (idx === -1) {
+      basket.tpOrders.push({ pct, sellPct });
+    } else {
+      basket.tpOrders[idx] = { pct, sellPct };
+    }
+    basket.tpOrders.sort((a, b) => a.pct - b.pct);
+    saveState(state); delete sessions[chatId];
+    bot.sendMessage(chatId, '✅ TP saved: +' + pct + '% → sell ' + sellPct + '%');
+    // re-show basket TP panel
+    bot.emit('callback_query', { ...query, data: 'bs_tp_' + sid });
+    return;
+  }
+  if (data.startsWith('btp_trg_')) {
+    // btp_trg_{sid}_{i} — edit trigger for existing TP
+    const rest = data.replace('btp_trg_', '');
+    const lastU = rest.lastIndexOf('_');
+    const sid = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    sessions[chatId] = { type: 'btp_pick', step: 'trg', basketSid: sid, idx: i, data: {}, createdAt: Date.now() };
+    const rows = tpTriggerPicker('btp_trg_v_' + sid + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'bs_tp_' + sid }]);
+    bot.sendMessage(chatId, '✏️ *TP' + (i+1) + ' — New trigger %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('btp_sel_')) {
+    // btp_sel_{sid}_{i} — edit sell % for existing TP
+    const rest = data.replace('btp_sel_', '');
+    const lastU = rest.lastIndexOf('_');
+    const sid = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    const pct = basket.tpOrders[i]?.pct;
+    sessions[chatId] = { type: 'btp_pick', step: 'sel', basketSid: sid, idx: i, data: { pct }, createdAt: Date.now() };
+    const rows = tpSellPicker('btp_sel_v_' + sid + '_' + i + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'bs_tp_' + sid }]);
+    bot.sendMessage(chatId, '✏️ *TP' + (i+1) + ' +' + pct + '% — Sell %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('btp_del_')) {
+    const rest = data.replace('btp_del_', '');
+    const lastU = rest.lastIndexOf('_');
+    const sid = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    basket.tpOrders.splice(i, 1); saveState(state);
+    bot.emit('callback_query', { ...query, data: 'bs_tp_' + sid });
+    return;
+  }
+
+  // Basket coin management
+  if (data.startsWith('bc_add_')) {
+    const sid = data.replace('bc_add_', '');
+    sessions[chatId] = { type: 'basket_field', field: 'coin_add', basketSid: sid, createdAt: Date.now() };
+    bot.sendMessage(chatId, '🪙 Paste coin address to add:');
+    return;
+  }
+  if (data.startsWith('bc_rm_')) {
+    const rest = data.replace('bc_rm_', '');
+    const lastU = rest.lastIndexOf('_');
+    const sid = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const basket = findBasketByShort(sid);
+    if (!basket) return;
+    basket.coins.splice(i, 1); saveState(state);
+    sendBasketCoins(chatId, basket);
+    return;
+  }
+
+  // ── Global TP edits (button-based) ──
+  if (data === 'gtp_add') {
+    sessions[chatId] = { type: 'gtp_pick', step: 'trg', idx: -1, createdAt: Date.now() };
+    const rows = tpTriggerPicker('gtp_trg_v_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'tp_global' }]);
+    bot.sendMessage(chatId, '➕ *Add Global TP — Trigger %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('gtp_trg_v_')) {
+    const pct = parseInt(data.replace('gtp_trg_v_', ''));
+    const sess = sessions[chatId];
+    if (!sess) return;
+    sess.data = { pct }; sess.step = 'sel';
+    const rows = tpSellPicker('gtp_sel_v_' + sess.idx + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'tp_global' }]);
+    bot.sendMessage(chatId, '➕ *+' + pct + '% — Sell %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('gtp_sel_v_')) {
+    const rest = data.replace('gtp_sel_v_', '');
+    const parts = rest.split('_');
+    const sellPct = parseInt(parts.pop()); const idx = parseInt(parts.pop());
+    const sess = sessions[chatId]; if (!sess) return;
+    const pct = sess.data?.pct; if (!pct) return;
+    if (idx === -1) state.tpOrders.push({ pct, sellPct });
+    else state.tpOrders[idx] = { pct, sellPct };
+    state.tpOrders.sort((a,b) => a.pct - b.pct);
+    saveState(state); delete sessions[chatId];
+    sendGlobalTpManager(chatId);
+    return;
+  }
+  if (data.startsWith('gtp_trg_')) {
+    const i = parseInt(data.replace('gtp_trg_', ''));
+    sessions[chatId] = { type: 'gtp_pick', step: 'trg', idx: i, data: {}, createdAt: Date.now() };
+    const rows = tpTriggerPicker('gtp_trg_v_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'tp_global' }]);
+    bot.sendMessage(chatId, '✏️ *TP' + (i+1) + ' — New trigger %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('gtp_sel_')) {
+    const i = parseInt(data.replace('gtp_sel_', ''));
+    const pct = state.tpOrders[i]?.pct;
+    sessions[chatId] = { type: 'gtp_pick', step: 'sel', idx: i, data: { pct }, createdAt: Date.now() };
+    const rows = tpSellPicker('gtp_sel_v_' + i + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'tp_global' }]);
+    bot.sendMessage(chatId, '✏️ *TP' + (i+1) + ' +' + pct + '% — Sell %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('gtp_del_')) {
+    const i = parseInt(data.replace('gtp_del_', ''));
+    state.tpOrders.splice(i, 1); saveState(state); sendGlobalTpManager(chatId);
+    return;
+  }
+
+  // ── Per-coin TP edits (button-based) ──
+  if (data.startsWith('ptpm_')) { const addr = addrFromKey(data.replace('ptpm_', '')); sendCoinTpManager(chatId, addr); return; }
+
+  if (data.startsWith('ctp_add_')) {
+    const k = data.replace('ctp_add_', '');
+    const addr = addrFromKey(k);
+    sessions[chatId] = { type: 'ctp_pick', step: 'trg', addrKey: k, idx: -1, data: {}, createdAt: Date.now() };
+    const rows = tpTriggerPicker('ctp_trg_v_' + k + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'ptpm_' + k }]);
+    bot.sendMessage(chatId, '➕ *Add TP — Trigger %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('ctp_trg_v_')) {
+    const rest = data.replace('ctp_trg_v_', '');
+    const lastU = rest.lastIndexOf('_');
+    const k = rest.slice(0, lastU); const pct = parseInt(rest.slice(lastU+1));
+    const addr = addrFromKey(k);
+    const sess = sessions[chatId]; if (!sess) return;
+    sess.data.pct = pct; sess.step = 'sel';
+    const rows = tpSellPicker('ctp_sel_v_' + k + '_' + sess.idx + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'ptpm_' + k }]);
+    bot.sendMessage(chatId, '➕ *+' + pct + '% — Sell %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('ctp_sel_v_')) {
+    const rest = data.replace('ctp_sel_v_', '');
+    const parts = rest.split('_');
+    const sellPct = parseInt(parts.pop()); const idx = parseInt(parts.pop());
+    const k = parts.join('_');
+    const addr = addrFromKey(k);
+    const pos = positions[addr]; if (!pos) return;
+    const sess = sessions[chatId]; if (!sess) return;
+    const pct = sess.data?.pct; if (!pct) return;
+    if (!pos.customTpOrders) pos.customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
+    if (idx === -1) pos.customTpOrders.push({ pct, sellPct });
+    else pos.customTpOrders[idx] = { pct, sellPct };
+    pos.customTpOrders.sort((a,b) => a.pct - b.pct);
+    pos.tpHits = new Array(pos.customTpOrders.length).fill(false);
+    savePositions(positions); delete sessions[chatId];
+    sendCoinTpManager(chatId, addr);
+    return;
+  }
+  if (data.startsWith('ctp_trg_')) {
+    const rest = data.replace('ctp_trg_', '');
+    const lastU = rest.lastIndexOf('_');
+    const k = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const addr = addrFromKey(k);
+    sessions[chatId] = { type: 'ctp_pick', step: 'trg', addrKey: k, idx: i, data: {}, createdAt: Date.now() };
+    const rows = tpTriggerPicker('ctp_trg_v_' + k + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'ptpm_' + k }]);
+    bot.sendMessage(chatId, '✏️ *TP' + (i+1) + ' — New trigger %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('ctp_sel_')) {
+    const rest = data.replace('ctp_sel_', '');
+    const lastU = rest.lastIndexOf('_');
+    const k = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const addr = addrFromKey(k);
+    const pos = positions[addr]; if (!pos) return;
+    const orders = pos.customTpOrders || state.tpOrders;
+    const pct = orders[i]?.pct;
+    sessions[chatId] = { type: 'ctp_pick', step: 'sel', addrKey: k, idx: i, data: { pct }, createdAt: Date.now() };
+    const rows = tpSellPicker('ctp_sel_v_' + k + '_' + i + '_');
+    rows.push([{ text: '◀️ Cancel', callback_data: 'ptpm_' + k }]);
+    bot.sendMessage(chatId, '✏️ *TP' + (i+1) + ' +' + pct + '% — Sell %:*', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } });
+    return;
+  }
+  if (data.startsWith('ctp_del_')) {
+    const rest = data.replace('ctp_del_', '');
+    const lastU = rest.lastIndexOf('_');
+    const k = rest.slice(0, lastU); const i = parseInt(rest.slice(lastU+1));
+    const addr = addrFromKey(k);
+    const pos = positions[addr]; if (!pos) return;
+    if (pos.customTpOrders) { pos.customTpOrders.splice(i, 1); pos.tpHits.splice(i, 1); savePositions(positions); }
+    sendCoinTpManager(chatId, addr);
+    return;
+  }
+  if (data.startsWith('ctp_rst_')) {
+    const k = data.replace('ctp_rst_', '');
+    const addr = addrFromKey(k);
+    const pos = positions[addr]; if (!pos) return;
+    pos.customTpOrders = null;
+    pos.tpHits = new Array(state.tpOrders.length).fill(false);
+    savePositions(positions);
+    sendCoinTpManager(chatId, addr);
+    return;
   }
 
   // ── Position detail ──
-  else if (data.startsWith('pd_')) {
-    const addr = addrFromKey(data.replace('pd_', ''));
-    sendCoinDetail(chatId, addr);
-  }
-  // ── Scanner action buttons ──
-  else if (data.startsWith('scan_')) {
-    const addr = addrFromKey(data.replace('scan_', ''));
-    scanToken(chatId, addr);
-  }
-  else if (data.startsWith('scanbuy_')) {
-    const parts = data.split('_'); const ethCode = parts[1]; const k = parts.slice(2).join('_');
-    const addr = addrFromKey(k);
-    if (ethCode === 'x') {
+  if (data.startsWith('pd_')) { const addr = addrFromKey(data.replace('pd_', '')); await sendCoinDetail(chatId, addr); return; }
+
+  // ── Buy / Sell on coin detail ──
+  if (data.startsWith('pb_')) {
+    const parts = data.split('_'); const code = parts[1]; const k = parts.slice(2).join('_');
+    const addr = addrFromKey(k); const pos = positions[addr]; if (!pos) return;
+    const wallet = posWallet(pos);
+    if (code === 'x') {
       sessions[chatId] = { type: 'buy_more', data: { address: addr }, createdAt: Date.now() };
-      bot.sendMessage(chatId, '🟢 Enter ETH amount to buy:');
+      bot.sendMessage(chatId, '🟢 Enter ETH amount:');
     } else {
-      const eth = ethCode === '005' ? 0.005 : parseFloat('0.' + ethCode);
-      const r = executeBuy(addr, eth, BUYER_WALLET);
+      const eth = code === '001' ? 0.001 : code === '005' ? 0.005 : parseFloat('0.' + code);
+      const r = executeBuy(addr, eth, wallet);
       if (r.success) {
-        addrKey(addr);
-        const pos = positions[addr];
-        if (!pos) {
-          positions[addr] = { coinName: addr.slice(0,8)+'...', address: addr, buyPriceUsd: null, boughtAt: Date.now(), ethSpent: eth, source: 'watcher', tpHits: new Array(state.tpOrders.length).fill(false), customTpOrders: null, fullyExited: false };
-        } else { pos.ethSpent = (pos.ethSpent||0) + eth; }
-        savePositions(positions);
+        pos.ethSpent = (pos.ethSpent || 0) + eth; savePositions(positions);
         const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
-        bot.sendMessage(chatId, '✅ Bought ' + eth + ' ETH\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+        bot.sendMessage(chatId, '✅ Bought *' + eth + ' ETH* of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+        await sendCoinDetail(chatId, addr);
       } else { bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
     }
-  }
-  else if (data.startsWith('scangrowth_')) {
-    const addr = addrFromKey(data.replace('scangrowth_', ''));
-    const pos = positions[addr];
-    const coinName = pos?.coinName || addr.slice(0,10)+'...';
-    sessions[chatId] = { type: 'growth', step: 'total_eth', data: { address: addr, coinName }, createdAt: Date.now() };
-    const buyerBal = getBalance(BUYER_WALLET);
-    const availEth = parseFloat(buyerBal?.wallet?.[0]?.balance || '0').toFixed(4);
-    bot.sendMessage(chatId, '🚀 *Growth Engine — ' + coinName + '*\n\n💰 Available: *' + availEth + ' ETH*\n\nTotal ETH to spend:', {
-      parse_mode: 'Markdown',
-      reply_markup: { inline_keyboard: [
-        [{ text: '0.005', callback_data: 'geth_v0.005' }, { text: '0.01', callback_data: 'geth_v0.01' }, { text: '0.02', callback_data: 'geth_v0.02' }, { text: '0.05', callback_data: 'geth_v0.05' }],
-        [{ text: '0.1', callback_data: 'geth_v0.1' }, { text: '0.5', callback_data: 'geth_v0.5' }, { text: '✏️ Custom', callback_data: 'geth_custom' }],
-      ]}
-    });
-  }
-  else if (data.startsWith('scandca_')) {
-    const addr = addrFromKey(data.replace('scandca_', ''));
-    const pos = positions[addr];
-    const coinName = pos?.coinName || addr.slice(0,10)+'...';
-    state.dca.customCoins = state.dca.customCoins || [];
-    if (!state.dca.customCoins.find(c => c.address === addr)) {
-      state.dca.customCoins.push({ address: addr, name: coinName, ethPerCycle: state.dca.ethPerCoin });
-      saveState(state);
-      addrKey(addr);
-      bot.sendMessage(chatId, '✅ *' + coinName + '* added to DCA\n' + state.dca.ethPerCoin + ' ETH per cycle\nAdjust in 📈 DCA Engine panel.', { parse_mode: 'Markdown' });
-    } else {
-      bot.sendMessage(chatId, 'ℹ️ Already in DCA list.');
-    }
+    return;
   }
 
-  else if (data.startsWith('pinfo_')) {
-    const addr = addrFromKey(data.replace('pinfo_', ''));
-    const coin = await fetchPrice(addr);
-    if (coin) {
-      bot.sendMessage(chatId, '*' + (coin.name || addr) + '*\n`' + addr + '`\nMcap: $' + coin.marketCap?.toLocaleString(undefined, {maximumFractionDigits:0}) + '\nHolders: ' + (coin.uniqueHolders || '?'), { parse_mode: 'Markdown' });
-    }
-  }
+  if (data.startsWith('ps_')) {
+    const parts = data.split('_'); const code = parts[1]; const k = parts.slice(2).join('_');
+    const addr = addrFromKey(k); const pos = positions[addr]; if (!pos) return;
+    const wallet = posWallet(pos);
 
-  // ── Coin buy/sell buttons ──
-  else if (data.startsWith('pb_')) {
-    const parts = data.split('_'); const ethCode = parts[1]; const k = parts.slice(2).join('_');
-    const addr = addrFromKey(k);
-    const pos = positions[addr];
-    if (!pos) return;
-    if (ethCode === 'x') {
-      sessions[chatId] = { type: 'buy_more', data: { address: addr }, createdAt: Date.now() };
-      bot.sendMessage(chatId, '🟢 Enter ETH amount to buy:');
-    } else {
-      const eth = ethCode === '001' ? 0.001 : ethCode === '005' ? 0.005 : parseFloat('0.' + ethCode);
-      const walletPath = pos.source === 'dca' ? DCA_WALLET : BUYER_WALLET;
-      const r = executeBuy(addr, eth, walletPath);
-      if (r.success) {
-        pos.ethSpent = (pos.ethSpent || 0) + eth;
-        savePositions(positions);
-        const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
-        bot.sendMessage(chatId, '✅ Bought more *' + pos.coinName + '* (' + eth + ' ETH)\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
-        sendCoinDetail(chatId, addr);
-      } else {
-        bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' });
-      }
-    }
-  }
-  else if (data.startsWith('ps_')) {
-    const parts = data.split('_'); const pctCode = parts[1]; const k = parts.slice(2).join('_');
-    const addr = addrFromKey(k);
-    const pos = positions[addr];
-    if (!pos) return;
-    const walletPath = pos.source === 'dca' ? DCA_WALLET : BUYER_WALLET;
-
-    if (pctCode === 'x') {
+    if (code === 'x') {
       sessions[chatId] = { type: 'manual_sell', data: { address: addr }, createdAt: Date.now() };
       bot.sendMessage(chatId, '🔴 Enter sell % (1-100):');
-    } else if (pctCode === 'init') {
+    } else if (code === 'bkv') {
+      // Sell to breakeven: sell enough to recoup original ETH
       const coin = await fetchPrice(addr);
       const ref = pos.avgBuyPrice || pos.buyPriceUsd;
-      if (coin?.priceUsd && ref) {
+      const ethSpent = parseFloat(pos.ethSpent || 0);
+      if (coin?.priceUsd && ref && ethSpent > 0) {
         const mult = coin.priceUsd / ref;
         const pct = Math.min(100, Math.round(100 / mult));
-        const r = executeSell(addr, pct, walletPath);
+        const r = executeSell(addr, pct, wallet);
         if (r.success) {
           savePositions(positions);
           const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
-          bot.sendMessage(chatId, '✅ Sold initials (~' + pct + '%) of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
-          sendCoinDetail(chatId, addr);
-        } else {
-          bot.sendMessage(chatId, '❌ Sell failed: `' + r.error + '`', { parse_mode: 'Markdown' });
-        }
-      } else {
-        bot.sendMessage(chatId, '❌ Price data unavailable for initials calculation.');
-      }
+          bot.sendMessage(chatId, '✅ Sold *' + pct + '%* (breakeven) of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+          await sendCoinDetail(chatId, addr);
+        } else { bot.sendMessage(chatId, '❌ Sell failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
+      } else { bot.sendMessage(chatId, '❌ Price data unavailable for breakeven calc.'); }
     } else {
-      const pct = parseInt(pctCode);
-      const r = executeSell(addr, pct, walletPath);
+      const pct = parseInt(code);
+      const r = executeSell(addr, pct, wallet);
       if (r.success) {
         if (pct === 100) pos.fullyExited = true;
         savePositions(positions);
         const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
         bot.sendMessage(chatId, '✅ Sold *' + pct + '%* of *' + pos.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
-        sendCoinDetail(chatId, addr);
-      } else {
-        bot.sendMessage(chatId, '❌ Sell failed: `' + r.error + '`', { parse_mode: 'Markdown' });
-      }
+        await sendCoinDetail(chatId, addr);
+      } else { bot.sendMessage(chatId, '❌ Sell failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
     }
+    return;
   }
 
-  // ── TP managers ──
-  else if (data === 'tp_global') { sendGlobalTpManager(chatId); }
-  else if (data.startsWith('ptpm_')) {
-    const addr = addrFromKey(data.replace('ptpm_', ''));
-    sendCoinTpManager(chatId, addr);
-  }
-  // Global TP edits
-  else if (data === 'gtpa') {
-    sessions[chatId] = { type: 'tp', step: 'pct', data: { editIndex: -1 }, createdAt: Date.now() };
-    bot.sendMessage(chatId, '➕ *Add Global TP*\nEnter trigger %:', { parse_mode: 'Markdown' });
-  }
-  else if (data.startsWith('gtpd_')) {
-    const i = parseInt(data.replace('gtpd_', ''));
-    state.tpOrders.splice(i, 1); saveState(state); sendGlobalTpManager(chatId);
-  }
-  else if (data.startsWith('gtpep_')) {
-    const i = parseInt(data.replace('gtpep_', ''));
-    sessions[chatId] = { type: 'tp', step: 'pct', data: { editIndex: i }, createdAt: Date.now() };
-    bot.sendMessage(chatId, '✏️ Edit TP' + (i+1) + ' trigger (current: +' + state.tpOrders[i].pct + '%):\nEnter new %:');
-  }
-  else if (data.startsWith('gtpes_')) {
-    const i = parseInt(data.replace('gtpes_', ''));
-    sessions[chatId] = { type: 'tp', step: 'sell', data: { editIndex: i, pct: state.tpOrders[i].pct }, createdAt: Date.now() };
-    bot.sendMessage(chatId, '✏️ Edit TP' + (i+1) + ' sell % (current: ' + state.tpOrders[i].sellPct + '%):\nEnter new %:');
-  }
-  // Per-coin TP edits
-  else if (data.startsWith('tpa_')) {
-    const addr = addrFromKey(data.replace('tpa_', ''));
-    sessions[chatId] = { type: 'tp', step: 'pct', data: { editIndex: -1, forCoin: addr }, createdAt: Date.now() };
-    bot.sendMessage(chatId, '➕ *Add TP for ' + (positions[addr]?.coinName || addr) + '*\nEnter trigger %:', { parse_mode: 'Markdown' });
-  }
-  else if (data.startsWith('tpd_')) {
-    const parts = data.split('_'); const i = parseInt(parts[parts.length-1]); const k = parts.slice(1, parts.length-1).join('_');
+  // ── Scanner ──
+  if (data.startsWith('scan_')) { const addr = addrFromKey(data.replace('scan_', '')); await scanToken(chatId, addr); return; }
+  if (data.startsWith('scanbuy_x_')) {
+    const k = data.replace('scanbuy_x_', '');
     const addr = addrFromKey(k);
-    if (positions[addr]?.customTpOrders) { positions[addr].customTpOrders.splice(i, 1); positions[addr].tpHits.splice(i, 1); savePositions(positions); }
-    sendCoinTpManager(chatId, addr);
-  }
-  else if (data.startsWith('tper_')) {
-    const addr = addrFromKey(data.replace('tper_', ''));
-    if (positions[addr]) { positions[addr].customTpOrders = null; positions[addr].tpHits = new Array(state.tpOrders.length).fill(false); savePositions(positions); }
-    sendCoinTpManager(chatId, addr);
-  }
-  else if (data.startsWith('tpep_')) {
-    const parts = data.split('_'); const i = parseInt(parts[parts.length-1]); const k = parts.slice(1, parts.length-1).join('_');
-    const addr = addrFromKey(k);
-    sessions[chatId] = { type: 'tp', step: 'pct', data: { editIndex: i, forCoin: addr }, createdAt: Date.now() };
-    bot.sendMessage(chatId, '✏️ Edit trigger for TP' + (i+1) + ':');
-  }
-  else if (data.startsWith('tpes_')) {
-    const parts = data.split('_'); const i = parseInt(parts[parts.length-1]); const k = parts.slice(1, parts.length-1).join('_');
-    const addr = addrFromKey(k);
-    const orders = positions[addr]?.customTpOrders || state.tpOrders;
-    sessions[chatId] = { type: 'tp', step: 'sell', data: { editIndex: i, pct: orders[i].pct, forCoin: addr }, createdAt: Date.now() };
-    bot.sendMessage(chatId, '✏️ Edit sell % for TP' + (i+1) + ':');
-  }
-  else if (data.startsWith('tpr_')) {
-    const addr = addrFromKey(data.replace('tpr_', ''));
-    if (positions[addr]) { positions[addr].customTpOrders = null; positions[addr].tpHits = new Array(state.tpOrders.length).fill(false); savePositions(positions); }
-    sendCoinTpManager(chatId, addr);
-  }
-
-  // ── TP set callbacks (button-based picker results) ──
-  else if (data.startsWith('tpset_pct_')) {
-    // tpset_pct_<value>_<context>
-    const parts = data.split('_'); const pct = parseInt(parts[2]); const ctx = parts.slice(3).join('_');
-    bot.answerCallbackQuery(query.id, { text: '🎯 +' + pct + '% set' });
-    // Now show sell % picker with same context but prefixed for sell step
-    if (ctx.startsWith('g_')) {
-      const i = parseInt(ctx.replace('g_', ''));
-      sendTpSellPicker(chatId, 'gfull_' + i + '_' + pct, state.tpOrders[i]?.sellPct || 100);
-    } else if (ctx === 'ga') {
-      sendTpSellPicker(chatId, 'gafull_' + pct, 100);
-    } else if (ctx.startsWith('c_')) {
-      sendTpSellPicker(chatId, 'cfull_' + ctx.replace('c_','') + '_' + pct, 100);
-    } else if (ctx.startsWith('ca_')) {
-      const k = ctx.replace('ca_', '');
-      sendTpSellPicker(chatId, 'cafull_' + k + '_' + pct, 100);
-    }
-  }
-  else if (data.startsWith('tpset_sell_')) {
-    // tpset_sell_<value>_<context>
-    const parts = data.split('_'); const sellPct = parseInt(parts[2]); const ctx = parts.slice(3).join('_');
-    bot.answerCallbackQuery(query.id, { text: '💰 ' + sellPct + '% sell set' });
-
-    if (ctx.startsWith('gfull_')) {
-      // Edit existing global TP trigger+sell
-      const subParts = ctx.replace('gfull_','').split('_');
-      const i = parseInt(subParts[0]); const pct = parseInt(subParts[1]);
-      state.tpOrders[i] = { pct, sellPct }; state.tpOrders.sort((a,b)=>a.pct-b.pct); saveState(state);
-      bot.sendMessage(chatId, '✅ TP' + (i+1) + ' updated: +' + pct + '% → sell ' + sellPct + '%');
-      sendGlobalTpManager(chatId);
-    } else if (ctx.startsWith('gafull_')) {
-      // Add new global TP
-      const pct = parseInt(ctx.replace('gafull_',''));
-      state.tpOrders.push({ pct, sellPct }); state.tpOrders.sort((a,b)=>a.pct-b.pct); saveState(state);
-      bot.sendMessage(chatId, '✅ Added global TP: +' + pct + '% → sell ' + sellPct + '%');
-      sendGlobalTpManager(chatId);
-    } else if (ctx.startsWith('cfull_')) {
-      // Edit per-coin TP trigger+sell (ctx = cfull_<k>_<i>_<pct>)
-      const sub = ctx.replace('cfull_','').split('_');
-      const pct = parseInt(sub[sub.length-1]); const idx = parseInt(sub[sub.length-2]);
-      const k = sub.slice(0, sub.length-2).join('_');
-      const addr = addrFromKey(k);
-      if (!positions[addr].customTpOrders) positions[addr].customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
-      positions[addr].customTpOrders[idx] = { pct, sellPct };
-      positions[addr].customTpOrders.sort((a,b)=>a.pct-b.pct);
-      positions[addr].tpHits = new Array(positions[addr].customTpOrders.length).fill(false);
+    const r = executeBuy(addr, state.ethAmount, BUYER_WALLET);
+    if (r.success) {
+      addrKey(addr);
+      if (!positions[addr]) {
+        positions[addr] = { coinName: addr.slice(0,8)+'...', address: addr, buyPriceUsd: null, avgBuyPrice: null, boughtAt: Date.now(), ethSpent: state.ethAmount, source: 'watcher', tpHits: new Array(state.tpOrders.length).fill(false), customTpOrders: null, fullyExited: false };
+      } else { positions[addr].ethSpent = (positions[addr].ethSpent||0) + state.ethAmount; }
       savePositions(positions);
-      bot.sendMessage(chatId, '✅ ' + positions[addr].coinName + ' TP' + (idx+1) + ': +' + pct + '% → sell ' + sellPct + '%');
-      sendCoinTpManager(chatId, addr);
-    } else if (ctx.startsWith('cafull_')) {
-      // Add per-coin TP (ctx = cafull_<k>_<pct>)
-      const sub = ctx.replace('cafull_','').split('_');
-      const pct = parseInt(sub[sub.length-1]);
-      const k = sub.slice(0, sub.length-1).join('_');
-      const addr = addrFromKey(k);
-      if (!positions[addr].customTpOrders) positions[addr].customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
-      positions[addr].customTpOrders.push({ pct, sellPct });
-      positions[addr].customTpOrders.sort((a,b)=>a.pct-b.pct);
-      positions[addr].tpHits = new Array(positions[addr].customTpOrders.length).fill(false);
-      savePositions(positions);
-      bot.sendMessage(chatId, '✅ Added TP for ' + positions[addr].coinName + ': +' + pct + '% → sell ' + sellPct + '%');
-      sendCoinTpManager(chatId, addr);
-    } else {
-      // Direct sell% edit (no trigger change)
-      if (ctx.startsWith('g_')) {
-        const i = parseInt(ctx.replace('g_',''));
-        state.tpOrders[i].sellPct = sellPct; saveState(state);
-        bot.sendMessage(chatId, '✅ TP' + (i+1) + ' sell % → ' + sellPct + '%');
-        sendGlobalTpManager(chatId);
-      } else if (ctx.startsWith('c_')) {
-        const sub = ctx.replace('c_','').split('_');
-        const i = parseInt(sub[sub.length-1]); const k = sub.slice(0,sub.length-1).join('_');
-        const addr = addrFromKey(k);
-        if (!positions[addr].customTpOrders) positions[addr].customTpOrders = JSON.parse(JSON.stringify(state.tpOrders));
-        positions[addr].customTpOrders[i].sellPct = sellPct;
-        savePositions(positions);
-        bot.sendMessage(chatId, '✅ ' + positions[addr].coinName + ' TP' + (i+1) + ' sell % → ' + sellPct + '%');
-        sendCoinTpManager(chatId, addr);
-      }
+      const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
+      bot.sendMessage(chatId, '✅ Bought *' + state.ethAmount + ' ETH*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+    } else { bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
+    return;
+  }
+  if (data.startsWith('scandca_')) {
+    const k = data.replace('scandca_', '');
+    const addr = addrFromKey(k);
+    // Add to first enabled basket, or first basket, or prompt
+    const basket = (state.dca.baskets || []).find(b => b.enabled) || state.dca.baskets?.[0];
+    if (!basket) { bot.sendMessage(chatId, '⚠️ No baskets yet. Create one in 📈 DCA first.'); return; }
+    if (!basket.coins.find(c => c.address === addr)) {
+      const coin = await fetchPrice(addr);
+      const name = coin?.name || addr.slice(0,10)+'...';
+      basket.coins.push({ address: addr, name });
+      if (basket.mode !== 'coins') basket.mode = 'coins';
+      saveState(state); addrKey(addr);
+      bot.sendMessage(chatId, '✅ *' + name + '* added to basket *' + basket.name + '*\nMode set to coins.', { parse_mode: 'Markdown' });
+    } else { bot.sendMessage(chatId, 'ℹ️ Already in basket.'); }
+    return;
+  }
+
+  // ── Wallets ──
+  if (data.startsWith('w_det_')) { await sendWalletDetail(chatId, parseInt(data.replace('w_det_', ''))); return; }
+
+  if (data.startsWith('wtr_')) {
+    if (data.startsWith('wtr_confirm_')) {
+      const fromIdx = parseInt(data.replace('wtr_confirm_', ''));
+      const sess = sessions[chatId];
+      if (!sess || sess.type !== 'wallet_transfer') { bot.sendMessage(chatId, '⚠️ Session expired.'); return; }
+      const { amount } = sess.data;
+      const fromWallet = fromIdx === 0 ? BUYER_WALLET : DCA_WALLET;
+      const toWalletPath = fromIdx === 0 ? DCA_WALLET : BUYER_WALLET;
+      const toAddr = getWalletAddress(toWalletPath);
+      if (!toAddr) { bot.sendMessage(chatId, '❌ Cannot get destination address.'); delete sessions[chatId]; return; }
+      bot.sendMessage(chatId, '⏳ Sending ' + amount + ' ETH...');
+      const r = executeTransfer(fromWallet, toAddr, amount);
+      delete sessions[chatId];
+      if (r.success) {
+        const tx = r.data?.transactionHash || r.data?.txHash || 'pending';
+        bot.sendMessage(chatId, '✅ Transferred *' + amount + ' ETH*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+      } else { bot.sendMessage(chatId, '❌ Transfer failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
+      await sendWalletsPanel(chatId);
+      return;
     }
+    const fromIdx = parseInt(data.replace('wtr_', ''));
+    sessions[chatId] = { type: 'wallet_transfer', step: 'amount', data: { fromIdx }, createdAt: Date.now() };
+    const fromLabel = fromIdx === 0 ? 'Listening' : 'DCA';
+    const toLabel   = fromIdx === 0 ? 'DCA' : 'Listening';
+    const fromWalletPath = fromIdx === 0 ? BUYER_WALLET : DCA_WALLET;
+    const bal = getBalance(fromWalletPath);
+    const avail = parseFloat(bal?.wallet?.[0]?.balance || '0').toFixed(5);
+    bot.sendMessage(chatId,
+      '↔️ *Transfer* ' + fromLabel + ' → ' + toLabel + '\nAvailable: *' + avail + ' ETH*\n\nEnter amount:',
+      { parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: [
+          [0.001, 0.005, 0.01, 0.05].map(v => ({ text: v + ' ETH', callback_data: 'wtr_amt_' + fromIdx + '_' + v })),
+          [0.1, 0.5].map(v => ({ text: v + ' ETH', callback_data: 'wtr_amt_' + fromIdx + '_' + v })),
+        ]}
+      }
+    );
+    return;
+  }
+  if (data.startsWith('wtr_amt_')) {
+    const rest = data.replace('wtr_amt_', '');
+    const parts = rest.split('_');
+    const v = parseFloat(parts.pop()); const fromIdx = parseInt(parts.pop());
+    sessions[chatId] = { type: 'wallet_transfer', step: 'confirm', data: { fromIdx, amount: v }, createdAt: Date.now() };
+    const fromLabel = fromIdx === 0 ? 'Listening' : 'DCA';
+    const toLabel   = fromIdx === 0 ? 'DCA' : 'Listening';
+    bot.sendMessage(chatId,
+      '💸 *Transfer Confirmation*\n\n*' + v + ' ETH*  ' + fromLabel + ' → ' + toLabel + '\n\nAre you sure?',
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[
+        { text: '✅ Confirm', callback_data: 'wtr_confirm_' + fromIdx },
+        { text: '❌ Cancel', callback_data: 'wallets' },
+      ]]}}
+    );
+    return;
+  }
+
+  if (data.startsWith('wco_')) {
+    if (data.startsWith('wco_confirm_')) {
+      const walletIdx = parseInt(data.replace('wco_confirm_', ''));
+      const sess = sessions[chatId];
+      if (!sess || sess.type !== 'wallet_cashout') { bot.sendMessage(chatId, '⚠️ Session expired.'); return; }
+      const { toAddr, amount } = sess.data;
+      const fromWallet = walletIdx === 0 ? BUYER_WALLET : DCA_WALLET;
+      bot.sendMessage(chatId, '⏳ Sending...');
+      const r = executeTransfer(fromWallet, toAddr, amount);
+      delete sessions[chatId];
+      if (r.success) {
+        const tx = r.data?.transactionHash || r.data?.txHash || 'pending';
+        bot.sendMessage(chatId, '✅ Sent *' + amount + ' ETH* to `' + toAddr + '`\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
+      } else { bot.sendMessage(chatId, '❌ Send failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
+      await sendWalletsPanel(chatId);
+      return;
+    }
+    const walletIdx = parseInt(data.replace('wco_', ''));
+    sessions[chatId] = { type: 'wallet_cashout', step: 'address', data: { walletIdx }, createdAt: Date.now() };
+    bot.sendMessage(chatId, '💸 *Cash Out*\n\nPaste destination address:', { parse_mode: 'Markdown' });
+    return;
   }
 
   // ── Manual pending buys ──
-  else if (data.startsWith('pby_')) {
-    const key = data.replace('pby_', '');
-    const pending = sessions[key] || sessions[Object.keys(sessions).find(k => k.includes(key))];
+  if (data.startsWith('pby_')) {
+    const pkey = data.replace('pby_', '');
+    const pending = sessions[pkey];
     if (!pending) { bot.sendMessage(chatId, '⏰ Expired.'); return; }
     const r = executeBuy(pending.address, state.ethAmount, BUYER_WALLET);
     if (r.success) {
       addrKey(pending.address);
       positions[pending.address] = {
-        coinName: pending.coinName, address: pending.address, buyPriceUsd: pending.buyPriceUsd,
+        coinName: pending.coinName, address: pending.address,
+        buyPriceUsd: pending.buyPriceUsd, avgBuyPrice: pending.buyPriceUsd,
         boughtAt: Date.now(), ethSpent: state.ethAmount, source: 'watcher',
         tpHits: new Array(state.tpOrders.length).fill(false), customTpOrders: null, fullyExited: false,
       };
       savePositions(positions);
       const tx = r.data?.txHash || r.data?.transactionHash || 'pending';
       bot.sendMessage(chatId, '✅ Bought *' + pending.coinName + '*\nTx: `' + tx + '`', { parse_mode: 'Markdown' });
-    } else {
-      bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' });
-    }
-    Object.keys(sessions).filter(k => k.includes(key)).forEach(k => delete sessions[k]);
+    } else { bot.sendMessage(chatId, '❌ Buy failed: `' + r.error + '`', { parse_mode: 'Markdown' }); }
+    delete sessions[pkey];
+    return;
   }
-  else if (data.startsWith('psk_')) {
-    const key = data.replace('psk_', '');
-    Object.keys(sessions).filter(k => k.includes(key)).forEach(k => delete sessions[k]);
+  if (data.startsWith('psk_')) {
+    delete sessions[data.replace('psk_', '')];
     bot.sendMessage(chatId, '⏭ Skipped.');
+    return;
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-// Rebuild addrLookup from existing positions on startup
-Object.keys(positions).forEach(addr => addrKey(addr));
-log('Address lookup rebuilt: ' + Object.keys(addrLookup).length + ' entries');
+// ── Startup ───────────────────────────────────────────────────────────────────
+log('🎵 ' + (state.botName || 'SelectaBot') + ' starting up...');
+log('Positions loaded: ' + Object.keys(positions).length);
+log('addrLookup: ' + Object.keys(addrLookup).length + ' entries');
+log('Baskets: ' + (state.dca.baskets || []).length);
 
-log('🐸 Zora Combined Bot starting...');
 bot.getMe().then(me => {
-  log('Bot: @' + me.username + ' | Admin: ' + ADMIN_ID);
+  log('Bot: @' + me.username + ' (' + me.id + ') | Admin: ' + ADMIN_ID);
   log('Buyer wallet: ' + BUYER_WALLET);
   log('DCA wallet: ' + DCA_WALLET);
-}).catch(e => { log('ERROR: ' + e.message); process.exit(1); });
+}).catch(e => { log('FATAL: ' + e.message); process.exit(1); });
